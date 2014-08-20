@@ -152,6 +152,8 @@ class LimitedSFTPServer:
 	def makeDirectory(self, path, attrs):
 		realpath = self._fixPath(path)
 		print(" >> makeDirectory", path, attrs, realpath, file=sys.stderr)
+		if not self.chrootSpecs.allowWrite or self.chrootSpecs.createOnly:
+			raise ValueError("Directory creation not allowed")
 		os.mkdir(realpath)
 		self._setAttrs(path, attrs)
 
@@ -159,6 +161,8 @@ class LimitedSFTPServer:
 		print(" >> setAttrs", path, attrs, file=sys.stderr)
 		if self._fixPath(path) == self.chroot:
 			raise ValueError("No changing the attrs of the /")
+		if not self.chrootSpecs.allowWrite or self.chrootSpecs.createOnly:
+			raise ValueError("Mode-changing not allowed")
 		self._setAttrs(path, attrs)
 
 	def _setAttrs(self, path, attrs):
@@ -185,6 +189,8 @@ class LimitedSFTPServer:
 	def renameFile(self, oldpath, newpath):
 		print(" >> renameFile '%s' to '%s'" % (oldpath, newpath), file=sys.stderr)
 		if self.allowWrite:
+			if self.chrootSpecs.createOnly:
+				raise ValueError("In create-only mode, no renaming allowed")
 			realoldpath = self._fixPath(oldpath)
 			realnewpath = self._fixPath(newpath)
 			os.rename(realoldpath, realnewpath)
@@ -194,6 +200,8 @@ class LimitedSFTPServer:
 	def removeDirectory(self, path):
 		print(" >> removeDirectory", path, file=sys.stderr)
 		if self.allowWrite:
+			if self.chrootSpecs.createOnly:
+				raise ValueError("In create-only mode, no deleting allowed")
 			realpath = self._fixPath(path)
 			os.rmdir(realpath)
 		else:
@@ -206,6 +214,9 @@ class LimitedSFTPServer:
 			realTargetPath = self._fixPath(targetPath)
 			# TODO: Check if path is inside chroot. if so, do not fix to absolute path, leave it relative
 			print(" -- !! real link %s --> %s" % (realLinkPath, realTargetPath))
+
+			if self.chrootSpecs.createOnly and os.path.exists(realLinkPath):
+				raise ValueError("File already exists")
 			os.symlink(realLinkPath, realTargetPath)
 		else:
 			raise ValueError("Writing is not allowed")
@@ -255,7 +266,9 @@ class SFTPFile:
 		mode = 0777
 
 		if flags & FXF_WRITE == FXF_WRITE:
-			if allowWrite:
+			if self.server.chrootSpecs.allowWrite:
+				if self.server.chrootSpecs.createOnly and os.path.exists(filename):
+					raise ValueError("File already exists")
 				if flags & FXF_WRITE == FXF_WRITE and flags & FXF_READ == FXF_READ:
 					openFlags = os.O_RDWR
 				else:
@@ -296,7 +309,7 @@ class SFTPFile:
 		return os.read(self.fd, length)
 
 	def writeChunk(self, offset, data):
-		if self.allowWrite:
+		if self.server.chrootSpecs.allowWrite:
 			os.lseek(self.fd, offset, os.SEEK_SET)
 			return os.write(self.fd, data)
 		else:
