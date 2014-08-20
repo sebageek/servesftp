@@ -7,27 +7,21 @@ import argparse
 import os
 import sys
 
-from twisted import cred
-from twisted.internet import defer, protocol
+from Crypto.PublicKey import RSA
+
+from twisted import cred, internet
+from twisted.internet import defer, protocol, reactor
 from twisted.cred import portal, checkers
 from twisted.conch import avatar, interfaces as conchinterfaces, checkers as conchcheckers
-from twisted.conch.ssh import filetransfer, session, factory
+from twisted.conch.ssh import filetransfer, session, factory, keys
 from twisted.conch.ssh.filetransfer import FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC, FXF_EXCL
 from twisted.python import components
 from twisted.conch.ssh.keys import Key
 from twisted.conch.ls import lsLine
+from twisted.python.filepath import FilePath
 from zope.interface import implements
 
-# TODO: Config? Directory?
-
-# Hostkeys: use from commandline
-#               if none specified: look inside config dir
-#               if none present: generate, save to config dir
-#               if keys cannot be written to ~/.servesftp/id_rsa{,.pub}, warn user, continue
-
-
 # TODO:
-#	ssh handling (wirft ne exception)
 #	symbolische links, ..
 #		symlink outside of chroot?
 #	umask, default /?
@@ -35,9 +29,11 @@ from zope.interface import implements
 #		pathkram geradeziehen
 #		fix ALL the imports
 #	error messages
-#		better exceptions
-#		try to report things back to the user, how does twisted do this?
+#		better exceptions, replace all the ValueErrors with something sensible
+#		better error messages; well.. duh!
+#		try to report things back to the user, how does twisted do this? (protocol level, fs errors)
 #	is "none" auth somehow possible?
+#	filesystem specs implementieren
 
 
 class SSHUnavailableProtocol(protocol.Protocol):
@@ -50,19 +46,28 @@ class SSHUnavailableProtocol(protocol.Protocol):
 	def connectionLost(self, reason):
 		pass
 
+class ChrootSpecs(object):
+	def __init__(self, directory, allowWrite, createOnly, noSymlinks, followExternalSymlinks):
+		self.directory = self._fixDir(directory)
+		self.allowWrite = allowWrite
+		self.createOnly = createOnly
+		self.noSymlinks = noSymlinks
+		self.followExternalSymlinks = followExternalSymlinks
+
+	def _fixDir(self, directory):
+		return os.path.join(os.getcwd(), directory)
+
+
 class LimitedSFTPAvatar(avatar.ConchUser):
 	implements(conchinterfaces.ISession)
 
 	def __init__(self, chroot):
 		print("Init SFTPAvatar (%s)" % (self))
 		avatar.ConchUser.__init__(self)
-		self.channelLookup['session'] = session.SSHSession
-		self.subsystemLookup['sftp'] = filetransfer.FileTransferServer
 
 		self.chroot = chroot
-
-	def getBaseDir(self):
-		return os.path.join(os.getcwd(), self.chroot)
+		self.channelLookup['session'] = session.SSHSession
+		self.subsystemLookup['sftp'] = filetransfer.FileTransferServer
 
 	def openShell(self, protocol):
 		unavailableprotocol = SSHUnavailableProtocol()
@@ -90,16 +95,15 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 class LimitedSFTPServer:
 	implements(conchinterfaces.ISFTPServer)
 
-	def __init__(self, avatar, allowWrite=True):
-		self.allowWrite = allowWrite
+	def __init__(self, avatar):
 		self.avatar = avatar
-		self.chroot = avatar.getBaseDir()
+		self.chrootSpecs = avatar.chroot
+		self.chroot = self.chrootSpecs.directory
+
+		# set chroot
 		if not self.chroot.endswith("/"):
 			self.chroot = self.chroot + "/"
 		print("Initialized LimitedSFTPServer() for directory", self.chroot)
-
-	def isWritable(self):
-		return self.allowWrite
 
 	@staticmethod
 	def _statToAttrs(s):
@@ -152,7 +156,7 @@ class LimitedSFTPServer:
 		self._setAttrs(path, attrs)
 
 	def setAttrs(self, path, attrs):
-		print("Calling setattr for", path, "with", attrs)
+		print(" >> setAttrs", path, attrs, file=sys.stderr)
 		if self._fixPath(path) == self.chroot:
 			raise ValueError("No changing the attrs of the /")
 		self._setAttrs(path, attrs)
@@ -167,7 +171,7 @@ class LimitedSFTPServer:
 	def openFile(self, filename, flags, attrs):
 		print(" >> openFile", filename, flags, attrs, file=sys.stderr)
 
-		return SFTPFile(self, self._fixPath(filename), flags, attrs, allowWrite=self.allowWrite)
+		return SFTPFile(self, self._fixPath(filename), flags, attrs, allowWrite=self.chrootSpecs.allowWrite)
 		raise ValueError("maunz")
 
 	def removeFile(self, filename):
@@ -214,6 +218,7 @@ class LimitedSFTPServer:
 		print(" >> readlink %s --> %s" % (path, targetPath), file=sys.stderr)
 		return targetPath
 components.registerAdapter(LimitedSFTPServer, LimitedSFTPAvatar, filetransfer.ISFTPServer)
+
 
 class SFTPDirectory:
 	def __init__(self, path):
@@ -333,6 +338,13 @@ class NoneAuthorization:
 	def requestAvatarId(self, credentials):
 		return defer.succeed(str(credentials.username))
 
+class SSHAuthorizedKeysFile(conchcheckers.SSHPublicKeyDatabase):
+	def __init__(self, files):
+		self.files = files
+
+	def getAuthorizedKeysFiles(self, credentials):
+		return [FilePath(f) for f in self.files]
+
 
 def runSFTPServer():
 	# fire up ssh server
@@ -363,6 +375,7 @@ def _parser():
 
 	parser.add_argument("target", type=str, help="Directory to serve")
 	parser.add_argument("-p", "--port", default=2222, type=int, help="Port to run the sftp server on (Default: 2222)")
+	parser.add_argument("-d", "--debug", default=False, action="store_true", help="Enable twisted's debug facilities")
 
 	# filesystem stuff
 	parser.add_argument("-w", "--writable", default=False, action="store_true", help="Allow write operations (creating/changing/renaming/deleting files and directories)")
@@ -371,18 +384,12 @@ def _parser():
 	parser.add_argument("--fe", "--follow-external", default=False, action="store_true", help="Follow external symlinks (symlinks that point outside of the chroot)")
 
 	# user management/authorization/access
-	# TODO: User management, authorization
-	#		   allow users to be specified on commandline
-	#		   add --allow-all-users
-	#		   allow key based auth
-	#		   allow password based auth
-	#		   allow none-auth
 	# TODO: Web-command (aka "download this authorized keys file" or "use this authorized keys command")
 	parser.add_argument("-n", "--nullauth", default=False, action="store_true", help="Null-authentication. No authentication will be done, every user/password combination wins!")
 	parser.add_argument("-u", "--users", metavar="users", default=None, type=str, help="List of user/password combinations. Format: user1:passs1,user2:pass2,...")
 	parser.add_argument("-a", "--authorized-keys", metavar="authorized keys file", default=None, type=str, help="Path to an authorized_keys file filled with ssh publickeys")
 
-	# TODO: Hostkey management
+	# Hostkey management
 	parser.add_argument("-k", "--hostkey", metavar="hostkey", default=None, type=str, help="Hostkey to use. You only need to specify the private key")
 
 	parser.add_argument('--version', action='version', version='%(prog)s ' + __version__)
@@ -393,15 +400,127 @@ def _parser():
 def main():
 	parser = _parser()
 	args = parser.parse_args()
-	print(args)
 
 	if not args.users and not args.nullauth and not args.authorized_keys:
 		parser.error("No authorization chosen, please specify one with -n, -a or -u.")
 
-	return 0
-	runSFTPServer()
+	# fire up ssh server
+	targetWasCreated = False
+	if not os.path.exists(args.target):
+		if not args.writable:
+			print("Warning: You specified a non-existing target but didn't allow it to be writable.")
+			print("         You will basically serve an empty directory (which I will create for you.")
+		print("Creating target directory")
+		os.mkdir(args.target)
+		targetWasCreated = True
+	elif not os.path.isdir(args.target):
+		parser.error("Target needs to be a directory")
+
+	chroot = ChrootSpecs(args.target, args.writable, args.co, args.ns, args.fe)
+
+	realm = SFTPRealm(chroot)
+
+	sshFactory = factory.SSHFactory()
+	sshFactory.portal = portal.Portal(realm)
+
+	# hostkey handling
+	privateKey = None
+
+	try:
+		if args.hostkey:
+			privateKey = Key.fromString(data=open(args.hostkey).read())
+		else:
+			confPath = os.path.expanduser("~/.servesftp/")
+			keyPath = os.path.join(confPath, "hostkey")
+			if os.path.exists(keyPath):
+				# load key from user's home
+				privateKey = Key.fromString(data=open(keyPath).read())
+			else:
+				bits = 2048
+				print("Generating %sbit RSA hostkey..." % bits)
+				rsaKey = RSA.generate(bits)
+				privateKey = Key.fromString(data=rsaKey.exportKey("PEM"))
+
+				try:
+					if not os.path.exists(confPath):
+						os.mkdir(confPath)
+					keyFile = open(keyPath, "w")
+					keyFile.write(rsaKey.exportKey("PEM") + "\n")
+					keyFile.close()
+				except (OSError, IOError) as e:
+					print("Warning: Could not save private key to %s: %s" % (keyPath, e))
+	except IOError as e:
+		print("Error: Could not open private hostkey: %s" % (e,))
+		privateKey = None
+	except keys.BadKeyError:
+		print("Error: The specified key is not in an understandable format!")
+		privateKey = None
+
+	if not privateKey:
+		print("No feasible hostkey could be found")
+		sys.exit(1)
+
+	if privateKey.isPublic():
+		print("You specified a public key as hostkey but a private one is needed.")
+		sys.exit(1)
+
+	sshFactory.publicKeys  = {'ssh-rsa': privateKey.public()}
+	sshFactory.privateKeys = {'ssh-rsa': privateKey}
+
+	# user access
+	if args.nullauth:
+		sshFactory.portal.registerChecker(NoneAuthorization())
+
+	if args.authorized_keys:
+		sshFactory.portal.registerChecker(SSHAuthorizedKeysFile([args.authorized_keys]))
+
+	if args.users:
+		users = args.users.split(",")
+		userdb = {}
+		error = False
+		for i, user in enumerate(users, 1):
+			if ":" not in user:
+				print("Error: User number %d (%s) is missing a password!" % (i, user), file=sys.stderr)
+				error = True
+			else:
+				user, password = user.split(":")
+				if len(user) <= 0:
+					print("Error: User number %d has an empty username" % (i,), file=sys.stderr)
+					error = True
+				elif len(password) <= 0:
+					print("Error: User number %d (%s) has an empty password" % (i, user), file=sys.stderr)
+					error = True
+				else:
+					userdb[user] = password
+
+		if error:
+			sys.exit(1)
+		
+		# I actually don't care if they name their class "DontUse". It perfectly fits the need
+		# of a in-memory store for invaluable throw-away passwords.
+		sshFactory.portal.registerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse(**userdb))
+
+	if args.debug:
+		from twisted.python import log
+		log.startLogging(sys.stdout)
+
+	try:
+		reactor.listenTCP(args.port, sshFactory)
+	except internet.error.CannotListenError as e:
+		print("Error binding to port: %s" % (e,))
+		sys.exit(1)
+
+	# run the thing!
+	reactor.run()
+
+	# cleanup
+	if targetWasCreated:
+		# try to delete directory, if was left empty
+		try:
+			os.rmdir(args.target)
+		except OSError:
+			pass
+	print("Good bye")
 
 if __name__ == "__main__":
-	#from twisted.python import log
-	#log.startLogging(sys.stdout)
 	main()
