@@ -215,6 +215,8 @@ class LimitedSFTPServer:
 			# TODO: Check if path is inside chroot. if so, do not fix to absolute path, leave it relative
 			print(" -- !! real link %s --> %s" % (realLinkPath, realTargetPath))
 
+			if self.chrootSpecs.noSymlinks:
+				raise ValueError("Symlinks are not allowed")
 			if self.chrootSpecs.createOnly and os.path.exists(realLinkPath):
 				raise ValueError("File already exists")
 			os.symlink(realLinkPath, realTargetPath)
