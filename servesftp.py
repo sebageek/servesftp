@@ -187,11 +187,10 @@ class LimitedSFTPServer:
 		print(" >> openFile", filename, flags, attrs, file=sys.stderr)
 
 		return SFTPFile(self, self._fixPath(filename), flags, attrs, allowWrite=self.chrootSpecs.allowWrite)
-		raise ValueError("maunz")
 
 	def removeFile(self, filename):
 		print(" >> removeFile", filename, file=sys.stderr)
-		if self.allowWrite:
+		if self.chrootSpecs.allowWrite:
 			realpath = self._fixPath(filename)
 			os.unlink(realpath)
 		else:
@@ -199,7 +198,7 @@ class LimitedSFTPServer:
 
 	def renameFile(self, oldpath, newpath):
 		print(" >> renameFile '%s' to '%s'" % (oldpath, newpath), file=sys.stderr)
-		if self.allowWrite:
+		if self.chrootSpecs.allowWrite:
 			if self.chrootSpecs.createOnly:
 				raise ValueError("In create-only mode, no renaming allowed")
 			realoldpath = self._fixPath(oldpath)
@@ -210,7 +209,7 @@ class LimitedSFTPServer:
 
 	def removeDirectory(self, path):
 		print(" >> removeDirectory", path, file=sys.stderr)
-		if self.allowWrite:
+		if self.chrootSpecs.allowWrite:
 			if self.chrootSpecs.createOnly:
 				raise ValueError("In create-only mode, no deleting allowed")
 			realpath = self._fixPath(path)
@@ -220,7 +219,7 @@ class LimitedSFTPServer:
 
 	def makeLink(self, linkPath, targetPath):
 		print(" >> makeLink %s --> %s" % (linkPath, targetPath), file=sys.stderr)
-		if self.allowWrite:
+		if self.chrootSpecs.allowWrite:
 			realLinkPath = self._fixPath(linkPath)
 			realTargetPath = self._fixPath(targetPath)
 			# TODO: Check if path is inside chroot. if so, do not fix to absolute path, leave it relative
