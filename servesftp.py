@@ -6,6 +6,7 @@ __version__ = "0.1"
 import argparse
 import os
 import sys
+import re
 
 from Crypto.PublicKey import RSA
 
@@ -98,11 +99,11 @@ class LimitedSFTPServer:
 	def __init__(self, avatar):
 		self.avatar = avatar
 		self.chrootSpecs = avatar.chroot
-		self.chroot = self.chrootSpecs.directory
 
-		# set chroot
-		if not self.chroot.endswith("/"):
-			self.chroot = self.chroot + "/"
+		# get chroot path without symlink
+		self.chroot = os.path.realpath(self.chrootSpecs.directory).rstrip("/") + "/"
+		self.chrootRe = re.compile("^%s(/.*)?$" % re.escape(self.chroot.rstrip("/")))
+
 		print("Initialized LimitedSFTPServer() for directory", self.chroot)
 
 	@staticmethod
@@ -131,11 +132,21 @@ class LimitedSFTPServer:
 		result = os.path.join(self.chroot, abspath)
 		# ensure that path is in chroot
 		chrootfix = False
-		if not result.startswith(self.chroot):
+		if not self.chrootRe.match(result):
+			print(" !! CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
 			chrootfix = True
 			result = self.chroot
+			raise ValueError("CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
+
+		# check if path is a symlink and is outside
+		realpath = os.path.realpath(result)
+		print("Realpath", realpath)
+		if not self.chrootRe.match(realpath) and not self.chrootSpecs.followExternalSymlinks:
+			print("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
+			raise ValueError("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 
 		print("fixPath: %s ==(%s)==> %s%s" % (path, self.chroot, result, " (chroot fix)" if chrootfix else ""))
+
 
 		return result
 
