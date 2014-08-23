@@ -23,9 +23,6 @@ from twisted.python.filepath import FilePath
 from zope.interface import implements
 
 # TODO:
-#	symbolische links, ..
-#		symlink outside of chroot?
-#	umask, default /?
 #	cleanup
 #		pathkram geradeziehen
 #		fix ALL the imports
@@ -34,7 +31,6 @@ from zope.interface import implements
 #		better error messages; well.. duh!
 #		try to report things back to the user, how does twisted do this? (protocol level, fs errors)
 #	is "none" auth somehow possible?
-#	filesystem specs implementieren
 
 
 class SSHUnavailableProtocol(protocol.Protocol):
@@ -180,7 +176,6 @@ class LimitedSFTPServer:
 		realpath = self._fixPath(path)
 
 		if "permissions" in attrs:
-			# TODO: User specified umask?
 			os.chmod(realpath, attrs["permissions"] & 0777)
 
 	def openFile(self, filename, flags, attrs):
