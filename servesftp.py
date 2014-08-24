@@ -11,21 +11,18 @@ import re
 from Crypto.PublicKey import RSA
 
 from twisted import cred, internet
-from twisted.internet import defer, protocol, reactor
+from twisted.internet import reactor
+from twisted.python import components, filepath
 from twisted.cred import portal, checkers
 from twisted.conch import avatar, interfaces as conchinterfaces, checkers as conchcheckers
+from twisted.conch.ls import lsLine
 from twisted.conch.ssh import filetransfer, session, factory, keys
 from twisted.conch.ssh.filetransfer import FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC, FXF_EXCL
-from twisted.python import components
-from twisted.conch.ssh.keys import Key
-from twisted.conch.ls import lsLine
-from twisted.python.filepath import FilePath
 from zope.interface import implements
 
 # TODO:
 #	cleanup
 #		pathkram geradeziehen
-#		fix ALL the imports
 #	error messages
 #		better exceptions, replace all the ValueErrors with something sensible
 #		better error messages; well.. duh!
@@ -33,7 +30,7 @@ from zope.interface import implements
 #	is "none" auth somehow possible?
 
 
-class SSHUnavailableProtocol(protocol.Protocol):
+class SSHUnavailableProtocol(internet.protocol.Protocol):
 	def connectionMade(self):
 		self.transport.write("This SSH server runs SFTP only!\r\n")
 
@@ -356,14 +353,14 @@ class NoneAuthorization:
 	credentialInterfaces = (cred.credentials.IPluggableAuthenticationModules,)
 
 	def requestAvatarId(self, credentials):
-		return defer.succeed(str(credentials.username))
+		return internet.defer.succeed(str(credentials.username))
 
 class SSHAuthorizedKeysFile(conchcheckers.SSHPublicKeyDatabase):
 	def __init__(self, files):
 		self.files = files
 
 	def getAuthorizedKeysFiles(self, credentials):
-		return [FilePath(f) for f in self.files]
+		return [filepath.FilePath(f) for f in self.files]
 
 
 def runSFTPServer():
@@ -374,7 +371,7 @@ def runSFTPServer():
 	sshFactory.portal = portal.Portal(realm)
 
 	# crypto keys
-	privateKey = Key.fromString(data=open("id_rsa").read())
+	privateKey = keys.Key.fromString(data=open("id_rsa").read())
 	sshFactory.publicKeys  = {'ssh-rsa': privateKey.public()}
 	sshFactory.privateKeys = {'ssh-rsa': privateKey}
 
@@ -385,7 +382,6 @@ def runSFTPServer():
 	sshFactory.portal.registerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse(**users))
 
 
-	from twisted.internet import reactor
 	reactor.listenTCP(2222, sshFactory)
 	reactor.run()
 
@@ -448,18 +444,18 @@ def main():
 
 	try:
 		if args.hostkey:
-			privateKey = Key.fromString(data=open(args.hostkey).read())
+			privateKey = keys.Key.fromString(data=open(args.hostkey).read())
 		else:
 			confPath = os.path.expanduser("~/.servesftp/")
 			keyPath = os.path.join(confPath, "hostkey")
 			if os.path.exists(keyPath):
 				# load key from user's home
-				privateKey = Key.fromString(data=open(keyPath).read())
+				privateKey = keys.Key.fromString(data=open(keyPath).read())
 			else:
 				bits = 2048
 				print("Generating %sbit RSA hostkey..." % bits)
 				rsaKey = RSA.generate(bits)
-				privateKey = Key.fromString(data=rsaKey.exportKey("PEM"))
+				privateKey = keys.Key.fromString(data=rsaKey.exportKey("PEM"))
 
 				try:
 					if not os.path.exists(confPath):
