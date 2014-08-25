@@ -49,12 +49,14 @@ class ChrootSpecs(object):
 class LimitedSFTPAvatar(avatar.ConchUser):
 	implements(conchinterfaces.ISession)
 
-	def __init__(self, chroot):
+	def __init__(self, avatarId, chroot, debug=False):
 		avatar.ConchUser.__init__(self)
 
+		self.avatarId = avatarId
 		self.chroot = chroot
 		self.channelLookup['session'] = session.SSHSession
 		self.subsystemLookup['sftp'] = filetransfer.FileTransferServer
+		self.debug = debug
 
 	def openShell(self, protocol):
 		unavailableprotocol = SSHUnavailableProtocol()
@@ -85,12 +87,11 @@ class LimitedSFTPServer:
 	def __init__(self, avatar):
 		self.avatar = avatar
 		self.chrootSpecs = avatar.chroot
+		self.debug = avatar.debug
 
 		# get chroot path without symlink
 		self.chroot = os.path.realpath(self.chrootSpecs.directory).rstrip("/") + "/"
 		self.chrootRe = re.compile("^%s(/.*)?$" % re.escape(self.chroot.rstrip("/")))
-
-		print("Initialized LimitedSFTPServer() for directory", self.chroot)
 
 	@staticmethod
 	def _statToAttrs(s):
@@ -108,7 +109,8 @@ class LimitedSFTPServer:
 
 	def realPath(self, path):
 		realpath = os.path.abspath("/" + path.lstrip("/"))
-		print(" >> realpath called for", path, "==>", realpath, file=sys.stderr)
+		if self.debug:
+			print(" >> realpath called for", path, "==>", realpath, file=sys.stderr)
 		return realpath
 
 	def _fixPath(self, path, isStatCall=False):
@@ -117,7 +119,8 @@ class LimitedSFTPServer:
 		result = os.path.join(self.chroot, abspath)
 		# ensure that path is in chroot
 		if not self.chrootRe.match(result):
-			print(" !! CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
+			if self.debug:
+				print(" !! CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
 			raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
 
 		# check if path is a symlink and is outside
@@ -128,13 +131,15 @@ class LimitedSFTPServer:
 				print("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 				raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 
-		print("fixPath: %s (%s) ==(%s)==> %s" % (path, realpath, self.chroot, result))
+		if self.debug:
+			print("fixPath: %s (%s) ==(%s)==> %s" % (path, realpath, self.chroot, result))
 
 
 		return result
 
 	def getAttrs(self, path, followLinks):
-		print(" >> getAttrs", path, followLinks)
+		if self.debug:
+			print(" >> getAttrs", path, followLinks)
 		result = None
 		if followLinks:
 			result = os.lstat(self._fixPath(path))
@@ -146,19 +151,22 @@ class LimitedSFTPServer:
 
 	def openDirectory(self, path):
 		realpath = self._fixPath(path)
-		print(" >> openDirectory", path, "==>", realpath, file=sys.stderr)
+		if self.debug:
+			print(" >> openDirectory", path, "==>", realpath, file=sys.stderr)
 		return SFTPDirectory(realpath)
 
 	def makeDirectory(self, path, attrs):
 		realpath = self._fixPath(path)
-		print(" >> makeDirectory", path, attrs, realpath, file=sys.stderr)
+		if self.debug:
+			print(" >> makeDirectory", path, attrs, realpath, file=sys.stderr)
 		if not self.chrootSpecs.allowWrite or self.chrootSpecs.createOnly:
 			raise SFTPError(FX_PERMISSION_DENIED, "Directory creation not allowed (path: %s)" % path)
 		os.mkdir(realpath)
 		self._setAttrs(path, attrs)
 
 	def setAttrs(self, path, attrs):
-		print(" >> setAttrs", path, attrs, file=sys.stderr)
+		if self.debug:
+			print(" >> setAttrs", path, attrs, file=sys.stderr)
 		if self._fixPath(path) == self.chroot:
 			raise SFTPError(FX_PERMISSION_DENIED, "Calling setAttr on root directory is not allowed")
 		if not self.chrootSpecs.allowWrite or self.chrootSpecs.createOnly:
@@ -172,12 +180,14 @@ class LimitedSFTPServer:
 			os.chmod(realpath, attrs["permissions"] & 0777)
 
 	def openFile(self, filename, flags, attrs):
-		print(" >> openFile", filename, flags, attrs, file=sys.stderr)
+		if self.debug:
+			print(" >> openFile", filename, flags, attrs, file=sys.stderr)
 
 		return SFTPFile(self, self._fixPath(filename), flags, attrs, allowWrite=self.chrootSpecs.allowWrite)
 
 	def removeFile(self, filename):
-		print(" >> removeFile", filename, file=sys.stderr)
+		if self.debug:
+			print(" >> removeFile", filename, file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
 			realpath = self._fixPath(filename)
 			os.unlink(realpath)
@@ -185,7 +195,8 @@ class LimitedSFTPServer:
 			raise SFTPError(FX_PERMISSION_DENIED, "Writing is not allowed")
 
 	def renameFile(self, oldpath, newpath):
-		print(" >> renameFile '%s' to '%s'" % (oldpath, newpath), file=sys.stderr)
+		if self.debug:
+			print(" >> renameFile '%s' to '%s'" % (oldpath, newpath), file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
 			if self.chrootSpecs.createOnly:
 				raise SFTPError(FX_PERMISSION_DENIED, "In create-only mode, no renaming allowed")
@@ -196,7 +207,8 @@ class LimitedSFTPServer:
 			raise SFTPError(FX_PERMISSION_DENIED, "Writing (and therefore renaming) is not allowed")
 
 	def removeDirectory(self, path):
-		print(" >> removeDirectory", path, file=sys.stderr)
+		if self.debug:
+			print(" >> removeDirectory", path, file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
 			if self.chrootSpecs.createOnly:
 				raise SFTPError(FX_PERMISSION_DENIED, "In create-only mode, deleting directories is not allowed")
@@ -206,7 +218,8 @@ class LimitedSFTPServer:
 			raise SFTPError(FX_PERMISSION_DENIED, "Writing (and therefore deleting directories) is not allowed")
 
 	def makeLink(self, linkPath, targetPath):
-		print(" >> makeLink %s --> %s" % (targetPath, linkPath), file=sys.stderr)
+		if self.debug:
+			print(" >> makeLink %s --> %s" % (targetPath, linkPath), file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
 			realTargetPath = self._fixPath(targetPath)
 
@@ -228,7 +241,8 @@ class LimitedSFTPServer:
 		realpath = self._fixPath(path, isStatCall=True)
 		targetPath = os.readlink(realpath)
 
-		print(" >> readlink %s --> %s" % (path, targetPath), file=sys.stderr)
+		if self.debug:
+			print(" >> readlink %s --> %s" % (path, targetPath), file=sys.stderr)
 		return targetPath
 components.registerAdapter(LimitedSFTPServer, LimitedSFTPAvatar, filetransfer.ISFTPServer)
 
@@ -260,14 +274,18 @@ class SFTPFile:
 	implements(conchinterfaces.ISFTPFile)
 
 	def __init__(self, server, filename, flags, attrs, allowWrite=False):
-		print(" >> SFTPFile: open %s with flags %s and attrs %s" % (filename, flags, attrs), file=sys.stderr)
 		self.server = server
 		self.allowWrite = allowWrite
 		self.filename = filename
 		openFlags = 0
 		mode = 0777
+		isWrite = False
+
+		if self.server.debug:
+			print(" >> SFTPFile: open %s with flags %s and attrs %s" % (filename, flags, attrs), file=sys.stderr)
 
 		if flags & FXF_WRITE == FXF_WRITE:
+			isWrite = True
 			if self.server.chrootSpecs.allowWrite:
 				if self.server.chrootSpecs.createOnly and os.path.exists(filename):
 					raise SFTPError(FX_PERMISSION_DENIED, "File already exists")
@@ -299,11 +317,13 @@ class SFTPFile:
 		else:
 			mode = 0777
 
+		print("User '%s' is opening file '%s' for %s (mode %o)" % (server.avatar.avatarId, filename, "writing" if isWrite else "reading", mode))
 		self.fd = os.open(filename, openFlags, mode)
 		if attrs:
 			self.server._setAttrs(filename, attrs)
 
 	def close(self):
+		print("File %s closed" % (self.filename,))
 		os.close(self.fd)
 
 	def readChunk(self, offset, length):
@@ -328,13 +348,14 @@ class SFTPFile:
 class SFTPRealm(object):
 	implements(portal.IRealm)
 
-	def __init__(self, chroot):
+	def __init__(self, chroot, debug):
 		self.chroot = chroot
+		self.debug = debug
 
 	def requestAvatar(self, avatarId, mind, *interfaces):
-		print(" !! User '%s' logged in" % (avatarId,) )
+		print("User '%s' logged in" % (avatarId,))
 		if conchinterfaces.IConchUser in interfaces:
-			return interfaces[0], LimitedSFTPAvatar(self.chroot), lambda: self.reportConnClosed(avatarId)
+			return interfaces[0], LimitedSFTPAvatar(avatarId, self.chroot, self.debug), lambda: self.reportConnClosed(avatarId)
 
 	def reportConnClosed(self, username):
 		print("User %s closed the connection" % (username,))
@@ -415,7 +436,7 @@ def main():
 
 	chroot = ChrootSpecs(args.target, args.writable, args.co, args.ns, args.fe)
 
-	realm = SFTPRealm(chroot)
+	realm = SFTPRealm(chroot, args.debug)
 
 	sshFactory = factory.SSHFactory()
 	sshFactory.portal = portal.Portal(realm)
@@ -506,6 +527,8 @@ def main():
 	except internet.error.CannotListenError as e:
 		print("Error binding to port: %s" % (e,))
 		sys.exit(1)
+
+	print("\nServing directory %s on port %d\n" % (args.target, args.port))
 
 	# run the thing!
 	reactor.run()
