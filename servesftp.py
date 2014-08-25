@@ -27,7 +27,6 @@ from zope.interface import implements
 #		better exceptions, replace all the ValueErrors with something sensible
 #		better error messages; well.. duh!
 #		try to report things back to the user, how does twisted do this? (protocol level, fs errors)
-#	is "none" auth somehow possible?
 
 
 class SSHUnavailableProtocol(internet.protocol.Protocol):
@@ -346,14 +345,18 @@ class NoneAuthorization:
 	""" NoneAuthorization - "Passwordless" authorization
 
 	We use IPluggableAuthenticationModules as interface so ssh sends keyboard-interactive
-	as authentication method. Then we can instantly send an "okay" back. Another option
-	would be to patch a null-auth into ssh.
+	as authentication method. Then we can instantly send an "okay" back. Newer versions
+	of twisted-conch also support none-authentication (see [0]). For this to work this
+	class also implements the IAnonymous credential interface.
+
+	[0] http://twistedmatrix.com/users/diffresource.twistd/5531
 	"""
 	implements(checkers.ICredentialsChecker)
-	credentialInterfaces = (cred.credentials.IPluggableAuthenticationModules,)
+	credentialInterfaces = (cred.credentials.IPluggableAuthenticationModules, cred.credentials.IAnonymous,)
 
 	def requestAvatarId(self, credentials):
 		return internet.defer.succeed(str(credentials.username))
+
 
 class SSHAuthorizedKeysFile(conchcheckers.SSHPublicKeyDatabase):
 	def __init__(self, files):
