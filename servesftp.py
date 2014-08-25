@@ -22,7 +22,7 @@ from zope.interface import implements
 
 # TODO:
 #	cleanup
-#		pathkram geradeziehen
+#		prints
 
 class SSHUnavailableProtocol(internet.protocol.Protocol):
 	def connectionMade(self):
@@ -113,7 +113,7 @@ class LimitedSFTPServer:
 		print(">> realpath called for", path, "==>", realpath, file=sys.stderr)
 		return realpath
 
-	def _fixPath(self, path):
+	def _fixPath(self, path, isStatCall=False):
 		abspath = os.path.abspath("/" + path).lstrip("/")
 
 		result = os.path.join(self.chroot, abspath)
@@ -129,8 +129,10 @@ class LimitedSFTPServer:
 		realpath = os.path.realpath(result)
 		print("Realpath", realpath)
 		if not self.chrootRe.match(realpath) and not self.chrootSpecs.followExternalSymlinks:
-			print("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
-			raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
+			# if the result path is inside the chroot and a symlink and someone wants to do a stat on it then we'll allow it, else not
+			if not (self.chrootRe.match(result) and os.path.exists(result) and os.path.islink(result) and isStatCall):
+				print("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
+				raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 
 		print("fixPath: %s ==(%s)==> %s%s" % (path, self.chroot, result, " (chroot fix)" if chrootfix else ""))
 
@@ -138,9 +140,15 @@ class LimitedSFTPServer:
 		return result
 
 	def getAttrs(self, path, followLinks):
-		func = os.stat if followLinks else os.lstat
-		
-		return self._statToAttrs(func(self._fixPath(path)))
+		print(" >> getAttrs", path, followLinks)
+		result = None
+		if followLinks:
+			result = os.lstat(self._fixPath(path))
+		else:
+			self._fixPath(path, isStatCall=True)
+			result = os.stat(path)
+
+		return self._statToAttrs(result)
 
 	def openDirectory(self, path):
 		realpath = self._fixPath(path)
@@ -204,26 +212,28 @@ class LimitedSFTPServer:
 			raise SFTPError(FX_PERMISSION_DENIED, "Writing (and therefore deleting directories) is not allowed")
 
 	def makeLink(self, linkPath, targetPath):
-		print(" >> makeLink %s --> %s" % (linkPath, targetPath), file=sys.stderr)
+		print(" >> makeLink %s --> %s" % (targetPath, linkPath), file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
-			realLinkPath = self._fixPath(linkPath)
 			realTargetPath = self._fixPath(targetPath)
-			# TODO: Check if path is inside chroot. if so, do not fix to absolute path, leave it relative
-			print(" -- !! real link %s --> %s" % (realLinkPath, realTargetPath))
 
 			if self.chrootSpecs.noSymlinks:
 				raise SFTPError(FX_PERMISSION_DENIED, "Symlink creation are not allowed")
-			if self.chrootSpecs.createOnly and os.path.exists(realLinkPath):
+			if self.chrootSpecs.createOnly and os.path.exists(realTargetPath):
 				raise SFTPError(FX_PERMISSION_DENIED, "File already exists (create-only mode)")
-			os.symlink(realLinkPath, realTargetPath)
+
+			realLinkPath = os.path.realpath(os.path.join(self.chroot, linkPath))
+			if not self.chrootRe.match(realLinkPath):
+				print("Creating symlinks to files outside of the chroot is forbidden (target was: %s)" % realLinkPath)
+				raise SFTPError(FX_PERMISSION_DENIED, "Creating symlinks to files outside of the chroot is forbidden (target was: %s)" % realLinkPath)
+
+			os.symlink(linkPath, realTargetPath)
 		else:
 			raise SFTPError(FX_PERMISSION_DENIED, "Writing is not allowed")
 
 	def readLink(self, path):
-		realpath = self._fixPath(path)
+		realpath = self._fixPath(path, isStatCall=True)
 		targetPath = os.readlink(realpath)
 
-		# TODO: Make link relative to chroot, if relative link is absolute?
 		print(" >> readlink %s --> %s" % (path, targetPath), file=sys.stderr)
 		return targetPath
 components.registerAdapter(LimitedSFTPServer, LimitedSFTPAvatar, filetransfer.ISFTPServer)
