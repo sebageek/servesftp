@@ -385,27 +385,28 @@ def runSFTPServer():
 
 def _parser():
 	parser = argparse.ArgumentParser(description="Serve a directory via SFTP")
-	# TODO: Argument groups?
 
-	parser.add_argument("target", type=str, help="Directory to serve")
-	parser.add_argument("-p", "--port", default=2222, type=int, help="Port to run the sftp server on (Default: 2222)")
-	parser.add_argument("-d", "--debug", default=False, action="store_true", help="Enable twisted's debug facilities")
+	sftpgroup = parser.add_argument_group("SFTP")
+	sftpgroup.add_argument("target", type=str, help="Directory to serve")
+	sftpgroup.add_argument("-p", "--port", default=2222, type=int, help="Port to run the sftp server on (Default: 2222)")
+	sftpgroup.add_argument("-k", "--hostkey", metavar="hostkey", default=None, type=str, help="Hostkey to use. You only need to specify the private key")
 
 	# filesystem stuff
-	parser.add_argument("-w", "--writable", default=False, action="store_true", help="Allow write operations (creating/changing/renaming/deleting files and directories)")
-	parser.add_argument("--co", "--create-only", default=False, action="store_true", help="Only allow creation of files and directory, but no modification/deletion. Used with -w")
-	parser.add_argument("--ns", "--no-symlinks", default=False, action="store_true", help="Disallow creation of symlinks (Note: symlinks outside of the given directory are not allowed)")
-	parser.add_argument("--fe", "--follow-external", default=False, action="store_true", help="Follow external symlinks (symlinks that point outside of the chroot)")
+	fsgroup = parser.add_argument_group("filesystem")
+	fsgroup.add_argument("-w", "--writable", default=False, action="store_true", help="Allow write operations (creating/changing/renaming/deleting files and directories)")
+	fsgroup.add_argument("--co", "--create-only", default=False, action="store_true", help="Only allow creation of files and directory, but no modification/deletion. Used with -w")
+	fsgroup.add_argument("--ns", "--no-symlinks", default=False, action="store_true", help="Disallow creation of symlinks (Note: symlinks outside of the given directory are not allowed)")
+	fsgroup.add_argument("--fe", "--follow-external", default=False, action="store_true", help="Follow external symlinks (symlinks that point outside of the chroot)")
 
 	# user management/authorization/access
 	# TODO: Web-command (aka "download this authorized keys file" or "use this authorized keys command")
-	parser.add_argument("-n", "--nullauth", default=False, action="store_true", help="Null-authentication. No authentication will be done, every user/password combination wins!")
-	parser.add_argument("-u", "--users", metavar="users", default=None, type=str, help="List of user/password combinations. Format: user1:passs1,user2:pass2,...")
-	parser.add_argument("-a", "--authorized-keys", metavar="authorized keys file", default=None, type=str, help="Path to an authorized_keys file filled with ssh publickeys")
+	authgroup = parser.add_argument_group("authorization")
+	authgroup.add_argument("-n", "--nullauth", default=False, action="store_true", help="Null-authentication. No authentication will be done, every user/password combination wins!")
+	authgroup.add_argument("-u", "--users", metavar="users", default=None, type=str, help="List of user/password combinations. Format: user1:passs1,user2:pass2,...")
+	authgroup.add_argument("-a", "--authorized-keys", metavar="authorized keys file", default=None, type=str, help="Path to an authorized_keys file filled with ssh publickeys")
 
-	# Hostkey management
-	parser.add_argument("-k", "--hostkey", metavar="hostkey", default=None, type=str, help="Hostkey to use. You only need to specify the private key")
-
+	# misc
+	parser.add_argument("-d", "--debug", default=False, action="store_true", help="Enable twisted's debug facilities")
 	parser.add_argument('--version', action='version', version='%(prog)s ' + __version__)
 
 	return parser
