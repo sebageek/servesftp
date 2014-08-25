@@ -20,9 +20,6 @@ from twisted.conch.ssh import filetransfer, session, factory, keys
 from twisted.conch.ssh.filetransfer import SFTPError, FX_PERMISSION_DENIED, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC, FXF_EXCL
 from zope.interface import implements
 
-# TODO:
-#	cleanup
-#		prints
 
 class SSHUnavailableProtocol(internet.protocol.Protocol):
 	def connectionMade(self):
@@ -318,7 +315,7 @@ class SFTPFile:
 		else:
 			mode = 0777
 
-		print("User '%s' is opening file '%s' for %s (mode %o)" % (server.avatar.avatarId, filename, "writing" if isWrite else "reading", mode))
+		print("User '%s' is opening file '%s' for %s (mode %04o)" % (server.avatar.avatarId, filename, "writing" if isWrite else "reading", mode))
 		self.fd = os.open(filename, openFlags, mode)
 		if attrs:
 			self.server._setAttrs(filename, attrs)
