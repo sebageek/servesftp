@@ -50,7 +50,6 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 	implements(conchinterfaces.ISession)
 
 	def __init__(self, chroot):
-		print("Init SFTPAvatar (%s)" % (self))
 		avatar.ConchUser.__init__(self)
 
 		self.chroot = chroot
@@ -71,7 +70,7 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 		self.openShell(protocol)
 
 	def closed(self):
-		print("Avatar closed")
+		pass
 
 	def windowChanged(self, newWindowSize):
 		pass
@@ -105,12 +104,11 @@ class LimitedSFTPServer:
 		}
 
 	def gotVersion(self, otherVersion, otherExt):
-		print("gotVersion(): %s, %s, %s" % (self, otherVersion, otherExt))
-		return {"conchTest": "ext data"}
+		return {}
 
 	def realPath(self, path):
 		realpath = os.path.abspath("/" + path.lstrip("/"))
-		print(">> realpath called for", path, "==>", realpath, file=sys.stderr)
+		print(" >> realpath called for", path, "==>", realpath, file=sys.stderr)
 		return realpath
 
 	def _fixPath(self, path, isStatCall=False):
@@ -118,23 +116,19 @@ class LimitedSFTPServer:
 
 		result = os.path.join(self.chroot, abspath)
 		# ensure that path is in chroot
-		chrootfix = False
 		if not self.chrootRe.match(result):
 			print(" !! CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
-			chrootfix = True
-			result = self.chroot
 			raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
 
 		# check if path is a symlink and is outside
 		realpath = os.path.realpath(result)
-		print("Realpath", realpath)
 		if not self.chrootRe.match(realpath) and not self.chrootSpecs.followExternalSymlinks:
 			# if the result path is inside the chroot and a symlink and someone wants to do a stat on it then we'll allow it, else not
 			if not (self.chrootRe.match(result) and os.path.exists(result) and os.path.islink(result) and isStatCall):
 				print("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 				raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 
-		print("fixPath: %s ==(%s)==> %s%s" % (path, self.chroot, result, " (chroot fix)" if chrootfix else ""))
+		print("fixPath: %s (%s) ==(%s)==> %s" % (path, realpath, self.chroot, result))
 
 
 		return result
@@ -338,7 +332,7 @@ class SFTPRealm(object):
 		self.chroot = chroot
 
 	def requestAvatar(self, avatarId, mind, *interfaces):
-		print("Requesting avatar", avatarId, mind, interfaces)
+		print(" !! User '%s' logged in" % (avatarId,) )
 		if conchinterfaces.IConchUser in interfaces:
 			return interfaces[0], LimitedSFTPAvatar(self.chroot), lambda: self.reportConnClosed(avatarId)
 
@@ -370,28 +364,6 @@ class SSHAuthorizedKeysFile(conchcheckers.SSHPublicKeyDatabase):
 	def getAuthorizedKeysFiles(self, credentials):
 		return [filepath.FilePath(f) for f in self.files]
 
-
-def runSFTPServer():
-	# fire up ssh server
-	realm = SFTPRealm("/maunz")
-
-	sshFactory = factory.SSHFactory()
-	sshFactory.portal = portal.Portal(realm)
-
-	# crypto keys
-	privateKey = keys.Key.fromString(data=open("id_rsa").read())
-	sshFactory.publicKeys  = {'ssh-rsa': privateKey.public()}
-	sshFactory.privateKeys = {'ssh-rsa': privateKey}
-
-	# user access
-	sshFactory.portal.registerChecker(NoneAuthorization())
-	sshFactory.portal.registerChecker(conchcheckers.SSHPublicKeyDatabase())
-	users = {'seba': 'maunz'}
-	sshFactory.portal.registerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse(**users))
-
-
-	reactor.listenTCP(2222, sshFactory)
-	reactor.run()
 
 def _parser():
 	parser = argparse.ArgumentParser(description="Serve a directory via SFTP")
@@ -434,7 +406,7 @@ def main():
 	if not os.path.exists(args.target):
 		if not args.writable:
 			print("Warning: You specified a non-existing target but didn't allow it to be writable.")
-			print("         You will basically serve an empty directory (which I will create for you.")
+			print("         You will basically serve an empty directory (which I will create for you).")
 		print("Creating target directory")
 		os.mkdir(args.target)
 		targetWasCreated = True
