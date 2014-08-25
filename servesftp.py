@@ -140,12 +140,12 @@ class LimitedSFTPServer:
 	def getAttrs(self, path, followLinks):
 		if self.debug:
 			print(" >> getAttrs", path, followLinks)
+
 		result = None
 		if followLinks:
 			result = os.lstat(self._fixPath(path))
 		else:
-			self._fixPath(path, isStatCall=True)
-			result = os.stat(path)
+			result = os.stat(self._fixPath(path, isStatCall=True))
 
 		return self._statToAttrs(result)
 
