@@ -313,7 +313,7 @@ class SFTPFile:
 			raise SFTPError(FX_PERMISSION_DENIED, "Unknown permission flags '%s'" % flags)
 
 		if "permissions" in attrs:
-			mode = attrs["permissions"]
+			mode = attrs["permissions"] & 0777
 			del(attrs["permissions"])
 		else:
 			mode = 0777
