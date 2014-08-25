@@ -189,8 +189,9 @@ class LimitedSFTPServer:
 		if self.debug:
 			print(" >> removeFile", filename, file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
-			realpath = self._fixPath(filename)
+			realpath = self._fixPath(filename, isStatCall=True)
 			os.unlink(realpath)
+			print("User '%s' removed file '%s'" % (self.avatar.avatarId, filename))
 		else:
 			raise SFTPError(FX_PERMISSION_DENIED, "Writing is not allowed")
 
