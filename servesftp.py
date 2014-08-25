@@ -17,17 +17,12 @@ from twisted.cred import portal, checkers
 from twisted.conch import avatar, interfaces as conchinterfaces, checkers as conchcheckers
 from twisted.conch.ls import lsLine
 from twisted.conch.ssh import filetransfer, session, factory, keys
-from twisted.conch.ssh.filetransfer import FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC, FXF_EXCL
+from twisted.conch.ssh.filetransfer import SFTPError, FX_PERMISSION_DENIED, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC, FXF_EXCL
 from zope.interface import implements
 
 # TODO:
 #	cleanup
 #		pathkram geradeziehen
-#	error messages
-#		better exceptions, replace all the ValueErrors with something sensible
-#		better error messages; well.. duh!
-#		try to report things back to the user, how does twisted do this? (protocol level, fs errors)
-
 
 class SSHUnavailableProtocol(internet.protocol.Protocol):
 	def connectionMade(self):
@@ -128,14 +123,14 @@ class LimitedSFTPServer:
 			print(" !! CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
 			chrootfix = True
 			result = self.chroot
-			raise ValueError("CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
+			raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot, whyever (chroot: %s, old: %s, joined: %s)" % (self.chroot, abspath, result))
 
 		# check if path is a symlink and is outside
 		realpath = os.path.realpath(result)
 		print("Realpath", realpath)
 		if not self.chrootRe.match(realpath) and not self.chrootSpecs.followExternalSymlinks:
 			print("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
-			raise ValueError("CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
+			raise SFTPError(FX_PERMISSION_DENIED, "CHROOT: Link is not inside chroot and following symlinks outside chroot is forbidden (path: %s, realpath: %s)" % (result, realpath))
 
 		print("fixPath: %s ==(%s)==> %s%s" % (path, self.chroot, result, " (chroot fix)" if chrootfix else ""))
 
@@ -156,16 +151,16 @@ class LimitedSFTPServer:
 		realpath = self._fixPath(path)
 		print(" >> makeDirectory", path, attrs, realpath, file=sys.stderr)
 		if not self.chrootSpecs.allowWrite or self.chrootSpecs.createOnly:
-			raise ValueError("Directory creation not allowed")
+			raise SFTPError(FX_PERMISSION_DENIED, "Directory creation not allowed (path: %s)" % path)
 		os.mkdir(realpath)
 		self._setAttrs(path, attrs)
 
 	def setAttrs(self, path, attrs):
 		print(" >> setAttrs", path, attrs, file=sys.stderr)
 		if self._fixPath(path) == self.chroot:
-			raise ValueError("No changing the attrs of the /")
+			raise SFTPError(FX_PERMISSION_DENIED, "Calling setAttr on root directory is not allowed")
 		if not self.chrootSpecs.allowWrite or self.chrootSpecs.createOnly:
-			raise ValueError("Mode-changing not allowed")
+			raise SFTPError(FX_PERMISSION_DENIED, "Mode-changing not allowed")
 		self._setAttrs(path, attrs)
 
 	def _setAttrs(self, path, attrs):
@@ -185,28 +180,28 @@ class LimitedSFTPServer:
 			realpath = self._fixPath(filename)
 			os.unlink(realpath)
 		else:
-			raise ValueError("Writing is not allowed")
+			raise SFTPError(FX_PERMISSION_DENIED, "Writing is not allowed")
 
 	def renameFile(self, oldpath, newpath):
 		print(" >> renameFile '%s' to '%s'" % (oldpath, newpath), file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
 			if self.chrootSpecs.createOnly:
-				raise ValueError("In create-only mode, no renaming allowed")
+				raise SFTPError(FX_PERMISSION_DENIED, "In create-only mode, no renaming allowed")
 			realoldpath = self._fixPath(oldpath)
 			realnewpath = self._fixPath(newpath)
 			os.rename(realoldpath, realnewpath)
 		else:
-			raise ValueError("Writing is not allowed")
+			raise SFTPError(FX_PERMISSION_DENIED, "Writing (and therefore renaming) is not allowed")
 
 	def removeDirectory(self, path):
 		print(" >> removeDirectory", path, file=sys.stderr)
 		if self.chrootSpecs.allowWrite:
 			if self.chrootSpecs.createOnly:
-				raise ValueError("In create-only mode, no deleting allowed")
+				raise SFTPError(FX_PERMISSION_DENIED, "In create-only mode, deleting directories is not allowed")
 			realpath = self._fixPath(path)
 			os.rmdir(realpath)
 		else:
-			raise ValueError("Writing is not allowed")
+			raise SFTPError(FX_PERMISSION_DENIED, "Writing (and therefore deleting directories) is not allowed")
 
 	def makeLink(self, linkPath, targetPath):
 		print(" >> makeLink %s --> %s" % (linkPath, targetPath), file=sys.stderr)
@@ -217,12 +212,12 @@ class LimitedSFTPServer:
 			print(" -- !! real link %s --> %s" % (realLinkPath, realTargetPath))
 
 			if self.chrootSpecs.noSymlinks:
-				raise ValueError("Symlinks are not allowed")
+				raise SFTPError(FX_PERMISSION_DENIED, "Symlink creation are not allowed")
 			if self.chrootSpecs.createOnly and os.path.exists(realLinkPath):
-				raise ValueError("File already exists")
+				raise SFTPError(FX_PERMISSION_DENIED, "File already exists (create-only mode)")
 			os.symlink(realLinkPath, realTargetPath)
 		else:
-			raise ValueError("Writing is not allowed")
+			raise SFTPError(FX_PERMISSION_DENIED, "Writing is not allowed")
 
 	def readLink(self, path):
 		realpath = self._fixPath(path)
@@ -271,7 +266,7 @@ class SFTPFile:
 		if flags & FXF_WRITE == FXF_WRITE:
 			if self.server.chrootSpecs.allowWrite:
 				if self.server.chrootSpecs.createOnly and os.path.exists(filename):
-					raise ValueError("File already exists")
+					raise SFTPError(FX_PERMISSION_DENIED, "File already exists")
 				if flags & FXF_WRITE == FXF_WRITE and flags & FXF_READ == FXF_READ:
 					openFlags = os.O_RDWR
 				else:
@@ -286,13 +281,13 @@ class SFTPFile:
 				if flags & FXF_EXCL == FXF_EXCL:
 					 openFlags |= os.O_EXCL
 			else:
-				raise ValueError("Write not allowed")
+				raise SFTPError(FX_PERMISSION_DENIED, "Write not allowed")
 		elif flags & FXF_READ == FXF_READ:
 			# ignore all other options, readonly
 			openFlags = os.O_RDONLY
 		else:
 			# unknown mode
-			raise ValueError("Unknown permission flags '%s'" % flags)
+			raise SFTPError(FX_PERMISSION_DENIED, "Unknown permission flags '%s'" % flags)
 
 		if "permissions" in attrs:
 			mode = attrs["permissions"]
@@ -316,7 +311,7 @@ class SFTPFile:
 			os.lseek(self.fd, offset, os.SEEK_SET)
 			return os.write(self.fd, data)
 		else:
-			raise ValueError("SFTPFile %s is read only!" % (self.filename))
+			raise SFTPError(FX_PERMISSION_DENIED, "SFTPFile %s is read only!" % (self.filename))
 
 	def getAttrs(self):
 		stat = os.fstat(self.fd)
