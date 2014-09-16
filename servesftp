@@ -255,21 +255,15 @@ class SCPProtocol(internet.protocol.Protocol):
 					# check if writable
 					if not self.sftpserver.chrootSpecs.allowWrite:
 						print("Write not allowed")
-						self.transport.write("\x02scp: Error: Write not allowed by server\n")
-						self.transport.loseConnection()
-						self.state = "borken"
+						self.sendError("Error", "Write not allowed by server", fatal=True)
 					else:
 						# we need to begin ==> iterate state
 						self._stateMachineNext(None)
 				else:
-					self.transport.write("\x02scp: Error: Please specify either -t or -f\n")
-					self.transport.loseConnection()
-					self.state = "borken"
+					self.sendError("Error", "please specify either -t or -f", fatal=True)
 			elif self.state == "cmd-parse-error":
 				print("Sending parse error")
-				self.transport.write("\x01scp: error: Could not parse command options (given: %s)\n" % (" ".join(self.cmd[1:])))
-				self.transport.loseConnection()
-				self.state = "borken"
+				self.sendError("Error", "could not parse command options (given: %s)\n" % (" ".join(self.cmd[1:])), fatal=True)
 			else:
 				print("Error: Unknown state in init phase of state machine, state was", self.state)
 		else:
