@@ -27,20 +27,6 @@ from twisted.conch.ssh.filetransfer import SFTPError, FX_PERMISSION_DENIED, FXF_
 from zope.interface import implements
 
 
-class SSHUnavailableProtocol(internet.protocol.Protocol):
-	def connectionMade(self):
-		self.transport.write("This SSH server runs SFTP only!\r\n")
-
-	def dataReceived(self, bytes):
-		pass
-
-	def connectionLost(self, reason):
-		pass
-
-
-class SCPError(Exception):
-	pass
-
 class SCPProtocol(internet.protocol.Protocol):
 	""" Implementation of SCP, description from https://blogs.oracle.com/janp/entry/how_the_scp_protocol_works """
 
@@ -424,12 +410,11 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 		self.channelLookup['session'] = session.SSHSession
 		self.subsystemLookup['sftp'] = filetransfer.FileTransferServer
 		self.debug = debug
+		self._scpprotocol = None
 
 	def openShell(self, protocol):
-		unavailableprotocol = SSHUnavailableProtocol()
-		protocol.makeConnection(session.wrapProtocol(unavailableprotocol))
-		unavailableprotocol.makeConnection(protocol)
-		protocol.loseConnection()
+		protocol.write("This SSH server runs SFTP only!\r\n")
+		protocol.processEnded(reason=failure.Failure(error.ProcessTerminated(1)))
 
 	def getPty(self, terminal, windowSize, attrs):
 		return None
