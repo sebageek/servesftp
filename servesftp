@@ -17,8 +17,8 @@ import re
 from Crypto.PublicKey import RSA
 
 from twisted import cred, internet
-from twisted.internet import reactor
-from twisted.python import components, filepath
+from twisted.internet import reactor, error
+from twisted.python import components, filepath, failure
 from twisted.cred import portal, checkers
 from twisted.conch import avatar, interfaces as conchinterfaces, checkers as conchcheckers
 from twisted.conch.ls import lsLine
@@ -65,6 +65,8 @@ class SCPProtocol(internet.protocol.Protocol):
 		parser.add_argument("-t", action="store_true", help="Sink mode")
 		parser.add_argument("-p", action="store_true", help="Preserve access times (used with -f)")
 		parser.add_argument("-r", action="store_true", help="Recursive mode, directories and stuff")
+		parser.add_argument("-d", action="store_true", help="Target should be a directory")
+		parser.add_argument("-v", action="store_true", help="Be more verbose. Currently ignored")
 
 		return parser
 
@@ -145,7 +147,7 @@ class SCPProtocol(internet.protocol.Protocol):
 		except (SFTPError, OSError, IOError) as e:
 			self.sendError("Error opening file", e.strerror if getattr(e, "strerror") else e.message)
 		else:
-			print("Successfully sending file")
+			print("Successfully receiving file")
 			self.state = "recv-file"
 			self._file = {'name': name, 'length': length, 'mode': mode, 'fileobj': fileObj, 'recvd': 0}
 			self.transport.write("\x00")
@@ -164,6 +166,8 @@ class SCPProtocol(internet.protocol.Protocol):
 		self._file['recvd'] += len(data)
 		if len(data) >= leftToSend:
 			# handle state machine stuff
+			self._file['fileobj'].close()
+			self._file = None
 			self.state = "recv-file-ack"
 
 			# if data left ==> back
@@ -228,10 +232,15 @@ class SCPProtocol(internet.protocol.Protocol):
 		if init:
 			if self.state == "init":
 				realpath = self.sftpserver._fixPath(self.args.target)
-				if os.path.isdir(realpath) and self.args.r:
+				pathIsDir = os.path.isdir(realpath)
+				if pathIsDir and self.args.r:
 					self.singleFile = False
 				else:
 					self.singleFile = True
+
+				if self.args.d and not pathIsDir:
+					self.sendError("error", "Target is not a directory (was requested with -d)", fatal=True)
+					self.state = "borken"
 
 				if self.args.f:
 					# source mode, send file or dir
@@ -309,7 +318,6 @@ class SCPProtocol(internet.protocol.Protocol):
 			else:
 				if self.state == "init":
 					# send them a zero to show that we're fine with things!
-					print("zero sent")
 					self.transport.write("\x00")
 					self.state = "recv-ctrl-msg"
 				elif self.state == "recv-ctrl-msg":
@@ -335,16 +343,26 @@ class SCPProtocol(internet.protocol.Protocol):
 							pass
 						elif msgType == "T":
 							pass
+						else:
+							self.sendError("Protocol Error", "Unknown control message type '%s'" %   (msgType,), fatal=True)
+					elif data[0] in ("\x00", "\x01", "\x02"):
+						msgType = data[0]
+						if msgType == "\x00":
+							# ack!
+							print("out of range ack, guess we are going to close this connection")
+							self.transport.write("\x00")
+							self.transport.loseConnection()
+							self.state = "borken"
 						elif msgType == "\x01":
+							# warning
 							pass
 						elif msgType == "\x02":
 							print("Client sent fatal error:", data[1:])
 							self.transport.loseConnection()
 							self.state = "borken"
-						else:
-							self.sendError("Protocol Error", "Unknown control message type '%s'" %   (msgType,), fatal=True)
 					else:
-						self.sendError("Protocol Error", "Well, I expected a newline from you", fatal=True)
+						print("unknown control data", repr(data))
+						self.sendError("Protocol Error", "Well, I expected a newline or a statusbyte from you", fatal=True)
 				elif self.state == "recv-file":
 					self._recvFile(data)
 				elif self.state == "recv-file-ack":
@@ -354,12 +372,13 @@ class SCPProtocol(internet.protocol.Protocol):
 					else:
 						print("Error receiving file, dunno. data was", repr(data))
 
-					if len(self._sinkDirStack) <= 0:
-						# they only sent a file, byebye
-						self.transport.loseConnection()
-						self.state = "borken"
-					else:
-						self.state = "recv-ctrl-msg"
+					self.state = "recv-ctrl-msg"
+					#if len(self._sinkDirStack) <= 0:
+					#	# they only sent a file, byebye
+					#	self.transport.loseConnection()
+					#	self.state = "borken"
+					#else:
+					#	self.state = "recv-ctrl-msg"
 				else:
 					print("Unknown sink-mode state")
 
@@ -371,9 +390,9 @@ class SCPProtocol(internet.protocol.Protocol):
 		print(msg)
 
 		self.transport.write("%s%s" % (errbyte, msg))
-		self.transport.loseConnection()
 		if fatal:
 			self.state = "borken"
+			self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(1)))
 
 	def connectionMade(self):
 		print("Connected scp")
@@ -382,6 +401,14 @@ class SCPProtocol(internet.protocol.Protocol):
 	def dataReceived(self, data):
 		print("===> DATA:", repr(data), "state:", self.state)
 		self._stateMachineNext(data)
+
+	def eofReceived(self):
+		# TODO: differentiate depending on state
+		if (self.sourceMode and (False)) or (not self.sourceMode and (False)):
+			# send error
+			self.sendError("protocol error", "Unexpected EOF", fatal=True)
+		else:
+			self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(0)))
 
 	def connectionLost(self, reason):
 		print("Connection closed:", reason)
@@ -424,8 +451,10 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 		if cmdParts[0] == "scp":
 			print("Launching python scp subsystem for user")
 			scpprotocol = SCPProtocol(cmdParts, self)
+
 			protocol.makeConnection(session.wrapProtocol(scpprotocol))
 			scpprotocol.makeConnection(protocol)
+			self._scpprotocol = scpprotocol
 		else:
 			print("User tried to exec command '%s'" % (cmd,))
 			self.openShell(protocol)
@@ -437,7 +466,8 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 		pass
 	
 	def eofReceived(self):
-		pass
+		if self._scpprotocol:
+			self._scpprotocol.eofReceived()
 
 
 class LimitedSFTPServer:
