@@ -29,6 +29,10 @@ from zope.interface import implements
 
 class SCPProtocol(internet.protocol.Protocol):
 	""" Implementation of SCP, description from https://blogs.oracle.com/janp/entry/how_the_scp_protocol_works """
+	# TODO: Refactor everything to work with partial messages (e.g. read single bytes, put remainings pack in statemachine)
+	# TODO: Catch all the exceptions which could be thrown by sftpserver
+	# TODO: In which state to we transition in case of an error?
+	# TODO: Handle -p / "P"
 
 	CHUNK_SIZE = 5 * 1024 * 1024
 	S_CONT, S_ERR, S_DONE = range(3)
@@ -47,8 +51,6 @@ class SCPProtocol(internet.protocol.Protocol):
 		except SystemExit:
 			self.args = None
 			print("Error: Parser could not parse cmd", cmd)
-			#self.transport.write("\x01scp: error: Could not parse command options (given: %s)\n" % (" ".join(cmd[1:])))
-			#self.transport.loseConnection()
 			self.state = "cmd-parse-error"
 
 		if self.args:
@@ -174,6 +176,45 @@ class SCPProtocol(internet.protocol.Protocol):
 			if len(data) > leftToSend:
 				self._stateMachineNext(data[leftToSend:])
 
+	def _initRecvDir(self, name, mode):
+		print("initrecvdir", name, mode)
+		basepath = None
+		if len(self._dirStack) > 0:
+			basepath = os.path.join(self._dirStack[-1]["path"], name.lstrip("/"))
+		else:
+			basepath = os.path.join(self.args.target, name)
+
+		self._dirStack.append({"path": basepath, "name": name, "mode": mode})
+		attrs = None
+		try:
+			attrs = self.sftpserver.getAttrs(basepath, followLinks=True)
+		except OSError:
+			pass
+
+		print("my dir is", basepath, "with name", name, "and mode", mode)
+		if attrs != None:
+			if not attrs["isDir"]:
+				self.sendError("error", "Path %s already exists and is a file" % (basepath,))
+				return
+		else:
+			print("Creating directory", basepath)
+			self.sftpserver.makeDirectory(basepath, {"permissions": mode})
+
+		self.transport.write("\x00")
+
+		# try to open file, if fail send error
+		#fileObj = None
+		#try:
+		#	fileObj = self.sftpserver.openFile(path, FXF_WRITE | FXF_CREAT, {'permissions': mode})
+		#except (SFTPError, OSError, IOError) as e:
+		#	self.sendError("Error opening file", e.strerror if getattr(e, "strerror") else e.message)
+		#else:
+		#	print("Successfully receiving file")
+		#	self.state = "recv-file"
+		#	self._file = {'name': name, 'length': length, 'mode': mode, 'fileobj': fileObj, 'recvd': 0}
+		#	self.transport.write("\x00")
+
+
 	def _initSendDirectory(self, path):
 		self._dirStack = [{'path': path, 'files': None, 'dirs': None}]
 
@@ -247,11 +288,12 @@ class SCPProtocol(internet.protocol.Protocol):
 					self.sourceMode = True
 					if os.path.isdir(realpath) and self.args.r:
 						self.singleFile = False
+						self._dirStack = []
 					else:
 						self.singleFile = True
 				elif self.args.t:
+					self._dirStack = []
 					self.sourceMode = False
-					self._sinkDirStack = []
 					# check if writable
 					if not self.sftpserver.chrootSpecs.allowWrite:
 						print("Write not allowed")
@@ -290,6 +332,7 @@ class SCPProtocol(internet.protocol.Protocol):
 							self._stateMachineNext(None)
 						else:
 							self.state = "borken"
+							print("Losing connection")
 							self.transport.loseConnection()
 				elif self.state in ("sending-file", "sending-dir-file"):
 					ret = self._sendFile()
@@ -300,9 +343,11 @@ class SCPProtocol(internet.protocol.Protocol):
 								# in case of error, call next state
 								self._stateMachineNext(None)
 						else:
+							print("Losing connection")
 							self.transport.loseConnection()
 							self.state = "borken"
 				elif self.state == "quit-after-data":
+					print("Losing connection")
 					self.transport.loseConnection()
 					self.state = "borken"
 				elif self.state == "borken":
@@ -334,9 +379,32 @@ class SCPProtocol(internet.protocol.Protocol):
 								# changes state if necessary, acks msg etc.
 								self._initRecvFile(name, length, mode)
 						elif msgType == "D":
-							pass
+							if self.singleFile:
+								self.sendError("Error", "Stop sending directories when you are not recursive!", fatal=True)
+								return
+
+							if len(msg) != 3:
+								self.sendError("Protocol Error", "Command 'D' takes ecactly 3 commands (%d given)" % len(msg), fatal=True)
+							mode, length, name = None, None, None
+							try:
+								mode = int(msg[0], 8)
+								length = int(msg[1])
+							except ValueError:
+								self.sendError("Protocol Error", "mode and length of 'D' command both need to be ints", fatal=True)
+							else:
+								name = msg[2]
+								# changes state if necessary, acks msg etc.
+								self._initRecvDir(name, mode)
 						elif msgType == "T":
 							pass
+						elif msgType == "E":
+							if self.singleFile:
+								self.sendError("Error", "You are in single file mode, you are not allowed to send 'E'")
+							elif len(self._dirStack) <= 0:
+								self.sendError("Protocol error", "There is no directory left to end for command 'E'")
+							else:
+								self._dirStack.pop(0)
+								self.transport.write("\x00")
 						else:
 							self.sendError("Protocol Error", "Unknown control message type '%s'" %   (msgType,), fatal=True)
 					elif data[0] in ("\x00", "\x01", "\x02"):
@@ -345,6 +413,7 @@ class SCPProtocol(internet.protocol.Protocol):
 							# ack!
 							print("out of range ack, guess we are going to close this connection")
 							self.transport.write("\x00")
+							print("Losing connection")
 							self.transport.loseConnection()
 							self.state = "borken"
 						elif msgType == "\x01":
@@ -352,6 +421,7 @@ class SCPProtocol(internet.protocol.Protocol):
 							pass
 						elif msgType == "\x02":
 							print("Client sent fatal error:", data[1:])
+							print("Losing connection")
 							self.transport.loseConnection()
 							self.state = "borken"
 					else:
@@ -367,12 +437,6 @@ class SCPProtocol(internet.protocol.Protocol):
 						print("Error receiving file, dunno. data was", repr(data))
 
 					self.state = "recv-ctrl-msg"
-					#if len(self._sinkDirStack) <= 0:
-					#	# they only sent a file, byebye
-					#	self.transport.loseConnection()
-					#	self.state = "borken"
-					#else:
-					#	self.state = "recv-ctrl-msg"
 				else:
 					print("Unknown sink-mode state")
 
@@ -397,12 +461,18 @@ class SCPProtocol(internet.protocol.Protocol):
 		self._stateMachineNext(data)
 
 	def eofReceived(self):
+		print("NOTE: Eof received")
 		# TODO: differentiate depending on state
-		if (self.sourceMode and (False)) or (not self.sourceMode and (False)):
-			# send error
-			self.sendError("protocol error", "Unexpected EOF", fatal=True)
+		if self.sourceMode:
+			# source mode errors?
+			pass
 		else:
-			self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(0)))
+			if not self.singleFile:
+				if len(self._dirStack) > 0:
+					self.sendError("Protocol error", "Unexpected EOF - there were directories left to send/end", fatal=True)
+					return
+
+		self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(0)))
 
 	def connectionLost(self, reason):
 		print("Connection closed:", reason)
@@ -525,12 +595,18 @@ class LimitedSFTPServer:
 			print(" >> getAttrs", path, followLinks)
 
 		result = None
+		myPath = None
 		if followLinks:
-			result = os.lstat(self._fixPath(path))
+			myPath = self._fixPath(path)
+			result = os.lstat(myPath)
 		else:
-			result = os.stat(self._fixPath(path, isStatCall=True))
+			myPath = self._fixPath(path, isStatCall=True)
+			result = os.stat(myPath)
 
-		return self._statToAttrs(result)
+		resultDict = self._statToAttrs(result)
+		resultDict["isDir"] = os.path.isdir(myPath)
+
+		return resultDict
 
 	def openDirectory(self, path):
 		realpath = self._fixPath(path)
