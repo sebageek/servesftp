@@ -59,9 +59,6 @@ class SCPProtocol(internet.protocol.Protocol):
 	def _genParser(self):
 		parser = argparse.ArgumentParser()
 
-		# TODO: Extra flags
-		#			-v seems to be passed..
-		#			-d ?
 		parser.add_argument("target", type=str, help="File/dir to copy")
 		parser.add_argument("-f", action="store_true", help="Source mode")
 		parser.add_argument("-t", action="store_true", help="Sink mode")
@@ -90,7 +87,7 @@ class SCPProtocol(internet.protocol.Protocol):
 			except OSError as e:
 				self._file["state"] = "done"
 				msg = "scp: %s: %s" % (path, e.strerror)
-				self.transport.write("\x01%s\n" % (msg,))
+				self.sendError("error", msg)
 				return self.S_ERR
 			stat = self._file['stat']
 
@@ -98,7 +95,7 @@ class SCPProtocol(internet.protocol.Protocol):
 				self._file['fileObj'] = self.sftpserver.openFile(path, FXF_READ, {})
 			except (SFTPError, OSError) as e:
 				self._file['state'] = "done"
-				self.transport.write("\x01%s: %s\n" % (path, e))
+				self.sendError(path, str(e))
 				return self.S_ERR
 
 		if self.args.p and self._file['state'] == 'init':
@@ -154,7 +151,7 @@ class SCPProtocol(internet.protocol.Protocol):
 			try:
 				handle = self.sftpserver.openDirectory(curr['path'])
 			except OSError as e:
-				self.transport.write("\x01scp: %s: %s\n" % (curr['path'], e.strerror))
+				self.sendError(curr['path'], e.strerror)
 				self._dirStack.pop(-1)
 				return self.S_ERR
 
@@ -301,19 +298,17 @@ class SCPProtocol(internet.protocol.Protocol):
 			if self.sourceMode:
 				if self.state == "init":
 					if data != "\x00":
-						# FIXME: correct handling
-						raise ValueError("No zero found!")
+						self.sendError("error", "Expected a 0x00 to initiate file transfer", fatal=True)
+						return
 					if self.singleFile:
 						self._initSendFile(self.args.target)
 						self.state = "sending-file"
-						self._stateMachineNext(None)
 					else:
 						self._initSendDirectory(self.args.target)
 						self.state = "sending-dir"
-						self._stateMachineNext(None)
+					self._stateMachineNext(None)
 				elif self.state == "sending-dir":
 					ret = self._sendDirectory()
-					print("Ret is", ret)
 					if ret != self.S_CONT:
 						if ret == self.S_ERR:
 							# error, continue with state machine
