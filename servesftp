@@ -139,6 +139,59 @@ class SCPProtocol(internet.protocol.Protocol):
 		else:
 			return self.S_DONE
 
+	def _initSendDirectory(self, path):
+		self._dirStack = [{'path': path, 'files': None, 'dirs': None}]
+
+	def _sendDirectory(self):
+		if len(self._dirStack) == 0:
+			print("Warning: _sendDirectory() called when already done.")
+			return self.S_ERR
+		print("called _sendDirectory,", self._dirStack[-1])
+		curr = self._dirStack[-1]
+		if curr["files"] == None:
+			# directory not read, do it now
+			handle = None
+			try:
+				handle = self.sftpserver.openDirectory(curr['path'])
+			except OSError as e:
+				self.transport.write("\x01scp: %s: %s\n" % (curr['path'], e.strerror))
+				self._dirStack.pop(-1)
+				return self.S_ERR
+
+			files, dirs = ([], [])
+			for (name, lsline, attrs) in handle:
+				#if lsline.startswith("d"):
+				if os.path.isdir(os.path.realpath(self.sftpserver._fixPath(os.path.join(curr["path"], name)))):
+					dirs.append(name)
+				else:
+					files.append(name)
+			curr["dirs"] = dirs
+			curr["files"] = files
+
+			# as the directory is new, we send a.. new... directory!
+			# message format: Dmmmm <length> <name>
+			stat = self.sftpserver.getAttrs(curr["path"], followLinks=True)
+			print(" -- send dir", curr["path"], "D%04o %d %s" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
+			self.transport.write("D%04o %d %s\n" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
+		elif len(curr["files"]) > 0:
+			f = curr["files"].pop(0)
+			(os.path.join(curr["path"], f))
+			self._initSendFile(os.path.join(curr["path"], f))
+			self.state = "sending-dir-file"
+			self._stateMachineNext(None)
+		elif len(curr["dirs"]) > 0:
+			d = curr["dirs"].pop(0)
+			self._dirStack.append({'path': os.path.join(curr["path"], d), 'files': None, 'dirs': None})
+			return self._sendDirectory()
+		else:
+			# done with this dir
+			self._dirStack.pop(-1)
+			print(" -- end dir", curr["path"])
+			self.transport.write("E\n")
+			if len(self._dirStack) > 0:
+				return self.S_DONE
+		return self.S_CONT
+
 	def _initRecvFile(self, name, length, mode):
 		print("initrecvfile")
 		path = os.path.join(self.args.target, name)
@@ -202,71 +255,6 @@ class SCPProtocol(internet.protocol.Protocol):
 
 		self.transport.write("\x00")
 
-		# try to open file, if fail send error
-		#fileObj = None
-		#try:
-		#	fileObj = self.sftpserver.openFile(path, FXF_WRITE | FXF_CREAT, {'permissions': mode})
-		#except (SFTPError, OSError, IOError) as e:
-		#	self.sendError("Error opening file", e.strerror if getattr(e, "strerror") else e.message)
-		#else:
-		#	print("Successfully receiving file")
-		#	self.state = "recv-file"
-		#	self._file = {'name': name, 'length': length, 'mode': mode, 'fileobj': fileObj, 'recvd': 0}
-		#	self.transport.write("\x00")
-
-
-	def _initSendDirectory(self, path):
-		self._dirStack = [{'path': path, 'files': None, 'dirs': None}]
-
-	def _sendDirectory(self):
-		if len(self._dirStack) == 0:
-			print("Warning: _sendDirectory() called when already done.")
-			return self.S_ERR
-		print("called _sendDirectory,", self._dirStack[-1])
-		curr = self._dirStack[-1]
-		if curr["files"] == None:
-			# directory not read, do it now
-			handle = None
-			try:
-				handle = self.sftpserver.openDirectory(curr['path'])
-			except OSError as e:
-				self.transport.write("\x01scp: %s: %s\n" % (curr['path'], e.strerror))
-				self._dirStack.pop(-1)
-				return self.S_ERR
-
-			files, dirs = ([], [])
-			for (name, lsline, attrs) in handle:
-				#if lsline.startswith("d"):
-				if os.path.isdir(os.path.realpath(self.sftpserver._fixPath(os.path.join(curr["path"], name)))):
-					dirs.append(name)
-				else:
-					files.append(name)
-			curr["dirs"] = dirs
-			curr["files"] = files
-
-			# as the directory is new, we send a.. new... directory!
-			# message format: Dmmmm <length> <name>
-			stat = self.sftpserver.getAttrs(curr["path"], followLinks=True)
-			print(" -- send dir", curr["path"], "D%04o %d %s" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
-			self.transport.write("D%04o %d %s\n" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
-		elif len(curr["files"]) > 0:
-			f = curr["files"].pop(0)
-			(os.path.join(curr["path"], f))
-			self._initSendFile(os.path.join(curr["path"], f))
-			self.state = "sending-dir-file"
-			self._stateMachineNext(None)
-		elif len(curr["dirs"]) > 0:
-			d = curr["dirs"].pop(0)
-			self._dirStack.append({'path': os.path.join(curr["path"], d), 'files': None, 'dirs': None})
-			return self._sendDirectory()
-		else:
-			# done with this dir
-			self._dirStack.pop(-1)
-			print(" -- end dir", curr["path"])
-			self.transport.write("E\n")
-			if len(self._dirStack) > 0:
-				return self.S_DONE
-		return self.S_CONT
 
 	def _stateMachineNext(self, data, init=False):
 		print("called _stateMachineNext(%s, %s) with state %s" % (repr(data), init, self.state))
