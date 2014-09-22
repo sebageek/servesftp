@@ -344,9 +344,14 @@ class SCPProtocol(internet.protocol.Protocol):
 					self.state = "recv-ctrl-msg"
 				elif self.state == "recv-ctrl-msg":
 					# parse a message!
-					if data.endswith("\n"):
-						msgType = data[0]
-						msg = data[1:].rstrip().split(" ")
+					remainingData = None
+					if data[0] in ('C', 'D', 'T', 'E', '\x00', '\x01', '\x02'):
+						splitData = data.split("\n", 1)
+						if len(splitData) > 1 and splitData[1] != '':
+							remainingData = splitData
+						thisData = splitData[0]
+						msgType = thisData[0]
+						msg = thisData[1:].rstrip().split(" ")
 						print(" >> Control message", msgType, "with args", " ".join(msg))
 						if msgType == "C":
 							if len(msg) != 3:
@@ -388,11 +393,7 @@ class SCPProtocol(internet.protocol.Protocol):
 							else:
 								self._dirStack.pop(0)
 								self.transport.write("\x00")
-						else:
-							self.sendError("Protocol Error", "Unknown control message type '%s'" %   (msgType,), fatal=True)
-					elif data[0] in ("\x00", "\x01", "\x02"):
-						msgType = data[0]
-						if msgType == "\x00":
+						elif msgType == "\x00":
 							# ack!
 							print("out of range ack, guess we are going to close this connection")
 							self.transport.write("\x00")
@@ -401,15 +402,21 @@ class SCPProtocol(internet.protocol.Protocol):
 							self.state = "borken"
 						elif msgType == "\x01":
 							# warning
+							print("User sent a warning, we are just going to ignore it (warning was %s)" % thisData[1:])
 							pass
 						elif msgType == "\x02":
 							print("Client sent fatal error:", data[1:])
 							print("Losing connection")
 							self.transport.loseConnection()
 							self.state = "borken"
+						else:
+							self.sendError("Protocol Error", "Unknown control message type '%s'" %   (repr(msgType),), fatal=True)
+
+						if remainingData != None:
+							self._stateMachineNext(remainingData)
 					else:
 						print("unknown control data", repr(data))
-						self.sendError("Protocol Error", "Well, I expected a newline or a statusbyte from you", fatal=True)
+						self.sendError("Protocol Error", "Well, I expected a control message from you and I found something starting with a '%s'. What a shame." % repr(msgType), fatal=True)
 				elif self.state == "recv-file":
 					self._recvFile(data)
 				elif self.state == "recv-file-ack":
