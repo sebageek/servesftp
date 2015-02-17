@@ -18,7 +18,7 @@ from Crypto.PublicKey import RSA
 
 from twisted import cred, internet
 from twisted.internet import reactor, error
-from twisted.python import components, filepath, failure
+from twisted.python import components, filepath, failure, log
 from twisted.cred import portal, checkers
 from twisted.conch import avatar, interfaces as conchinterfaces, checkers as conchcheckers
 from twisted.conch.ls import lsLine
@@ -27,7 +27,7 @@ from twisted.conch.ssh.filetransfer import SFTPError, FX_PERMISSION_DENIED, FXF_
 from zope.interface import implements
 
 
-class SCPProtocol(internet.protocol.Protocol):
+class SCPProtocol(internet.protocol.Protocol, log.Logger):
 	""" Implementation of SCP, description from https://blogs.oracle.com/janp/entry/how_the_scp_protocol_works """
 	# TODO: Refactor everything to work with partial messages (e.g. read single bytes, put remainings pack in statemachine)
 	# TODO: Catch all the exceptions which could be thrown by sftpserver
@@ -68,6 +68,9 @@ class SCPProtocol(internet.protocol.Protocol):
 		parser.add_argument("-v", action="store_true", help="Be more verbose. Currently ignored")
 
 		return parser
+
+	def logPrefix(self):
+		return "SCPProtocol"
 
 	def _initSendFile(self, path):
 		self._file = {'path': path, 'state': 'init', 'stat': None, 'fileObj': None}
@@ -167,6 +170,7 @@ class SCPProtocol(internet.protocol.Protocol):
 
 			# as the directory is new, we send a.. new... directory!
 			# message format: Dmmmm <length> <name>
+			# TODO: Exception catching
 			stat = self.sftpserver.getAttrs(curr["path"], followLinks=True)
 			print(" -- send dir", curr["path"], "D%04o %d %s" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
 			self.transport.write("D%04o %d %s\n" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
@@ -248,6 +252,7 @@ class SCPProtocol(internet.protocol.Protocol):
 				return
 		else:
 			print("Creating directory", basepath)
+			# TODO: Exception catching
 			self.sftpserver.makeDirectory(basepath, {"permissions": mode})
 
 		self.transport.write("\x00")
@@ -440,7 +445,12 @@ class SCPProtocol(internet.protocol.Protocol):
 		self.transport.write("%s%s" % (errbyte, msg))
 		if fatal:
 			self.state = "borken"
-			self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(1)))
+			self.scpDisconnect(1)
+
+	def scpDisconnect(self, statuscode):
+		print("Disconnecting scp service")
+		self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(int(statuscode))))
+		self.state = "borken"
 
 	def connectionMade(self):
 		print("Connected scp")
@@ -969,7 +979,6 @@ def main():
 		sshFactory.portal.registerChecker(checkers.InMemoryUsernamePasswordDatabaseDontUse(**userdb))
 
 	if args.debug:
-		from twisted.python import log
 		log.startLogging(sys.stdout)
 
 	try:
