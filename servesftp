@@ -8,7 +8,6 @@ from __future__ import print_function
 __version__ = "0.1"
 
 import argparse
-import errno
 import os
 import shlex
 import sys
@@ -29,13 +28,12 @@ from zope.interface import implements
 
 class SCPProtocol(internet.protocol.Protocol, log.Logger):
 	""" Implementation of SCP, description from https://blogs.oracle.com/janp/entry/how_the_scp_protocol_works """
-	# TODO: Refactor everything to work with partial messages (e.g. read single bytes, put remainings pack in statemachine)
-	# TODO: Catch all the exceptions which could be thrown by sftpserver
-	# TODO: In which state to we transition in case of an error?
-	# TODO: Handle -p / "P"
 
 	CHUNK_SIZE = 5 * 1024 * 1024
 	S_CONT, S_ERR, S_DONE = range(3)
+	cmd_C = re.compile(r"^C(?P<mode>\d+) (?P<size>\d+) (?P<name>.*)$")
+	cmd_D = re.compile(r"^D(?P<mode>\d+) 0 (?P<name>.*)$")
+	cmd_T = re.compile(r"^T(?P<ctime>\d+) (?P<ctime_ms>\d+) (?P<atime>\d+) (?P<atime_ms>\d+)$")
 
 	def __init__(self, cmd, avatar):
 		self.cmd = cmd
@@ -50,16 +48,35 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 			print(self.args)
 		except SystemExit:
 			self.args = None
-			print("Error: Parser could not parse cmd", cmd)
+			print("Error: Parser could not parse scp cmd", cmd)
 			self.state = "cmd-parse-error"
 
+		
+		self._buffer = ''
+		self._scpMode = "<unknown mode>"
+		self._state = "<unknown>"
+		self._recursive = self.args.r
+		self._preserve = self.args.p
+		self._workingDir = ["/"]
+		self._targetFile = None
+		self._dirStack = []
+		self._preserveTime = None
 		if self.args:
 			self.sinkMode = self.args.f
+
+		if self.args:
+			if self.args.t:
+				self._scpMode = "sink"
+				self._state = "init"
+			else:
+				self._scpMode = "source"
+		else:
+			self._scpMode = "init-error"
 
 	def _genParser(self):
 		parser = argparse.ArgumentParser()
 
-		parser.add_argument("target", type=str, help="File/dir to copy")
+		parser.add_argument("target", type=str, nargs='+', help="File/dir to copy")
 		parser.add_argument("-f", action="store_true", help="Source mode")
 		parser.add_argument("-t", action="store_true", help="Sink mode")
 		parser.add_argument("-p", action="store_true", help="Preserve access times (used with -f)")
@@ -72,410 +89,235 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 	def logPrefix(self):
 		return "SCPProtocol"
 
-	def _initSendFile(self, path):
-		self._file = {'path': path, 'state': 'init', 'stat': None, 'fileObj': None}
-
-	def _sendFile(self):
-		""" Assumes path exists """
-		print("called _sendFile(),", self._file)
-		path = self._file['path']
-		stat = self._file['stat']
-		needContinue = None
-
-		if self._file['stat'] == None:
-			try:
-				self._file['stat'] = self.sftpserver.getAttrs(path, followLinks=True)
-				if os.path.isdir(os.path.realpath(self.sftpserver._fixPath(path))):
-					raise OSError(errno.EISDIR, os.strerror(errno.EISDIR))
-			except OSError as e:
-				self._file["state"] = "done"
-				msg = "scp: %s: %s" % (path, e.strerror)
-				self.sendError("error", msg)
-				return self.S_ERR
-			stat = self._file['stat']
-
-			try:
-				self._file['fileObj'] = self.sftpserver.openFile(path, FXF_READ, {})
-			except (SFTPError, OSError) as e:
-				self._file['state'] = "done"
-				self.sendError(path, str(e))
-				return self.S_ERR
-
-		if self.args.p and self._file['state'] == 'init':
-			# Access time of file, format: T<mtime> <mtime-ms> <atime> <atime-ms>
-			print(" -- send access times for", path)
-			self.transport.write("T%d %d %d %d\n" % (stat['mtime'], 0, stat['atime'], 0))
-			self._file['state'] = "psend"
-			needContinue = True
-		elif self._file['state'] in ('init', 'psend'):
-			# Single file copy, format: Cmmmm <length> <filename>
-			# mmmm == mode in octal
-			print(" -- send file %s (%s)" % (path, "C%04o %d %s" % (stat["permissions"] & 07777, stat["size"], os.path.basename(path))))
-			self.transport.write("C%04o %d %s\n" % (stat["permissions"] & 07777, stat["size"], os.path.basename(path)))
-			self._file['state'] = "copy"
-			needContinue = True
-		elif self._file['state'] == "copy":
-			print(" -- send file contents")
-			p = 0
-			fileObj = self._file['fileObj']
-			data = fileObj.readChunk(0, self.CHUNK_SIZE)
-			while data != '':
-				print(" !!!! Sending chunk of data: (data: %s, length: %d)" % (repr(data), len(data)))
-				#self.transport.write(data)
-				self.transport.write(data)
-				p += self.CHUNK_SIZE
-				data = fileObj.readChunk(p, self.CHUNK_SIZE)
-
-			print("Done sending file", path)
-			self.transport.write("\x00")
-			needContinue = False
-			self._file["state"] = "done"
-		else:
-			print("WARNING WARNING WARNING: unknown state", self._file['state'])
-			needContinue = False
-
-		if needContinue:
-			return self.S_CONT
-		else:
-			return self.S_DONE
-
-	def _initSendDirectory(self, path):
-		self._dirStack = [{'path': path, 'files': None, 'dirs': None}]
-
-	def _sendDirectory(self):
-		if len(self._dirStack) == 0:
-			print("Warning: _sendDirectory() called when already done.")
-			return self.S_ERR
-		print("called _sendDirectory,", self._dirStack[-1])
-		curr = self._dirStack[-1]
-		if curr["files"] == None:
-			# directory not read, do it now
-			handle = None
-			try:
-				handle = self.sftpserver.openDirectory(curr['path'])
-			except OSError as e:
-				self.sendError(curr['path'], e.strerror)
-				self._dirStack.pop(-1)
-				return self.S_ERR
-
-			files, dirs = ([], [])
-			for (name, lsline, attrs) in handle:
-				#if lsline.startswith("d"):
-				if os.path.isdir(os.path.realpath(self.sftpserver._fixPath(os.path.join(curr["path"], name)))):
-					dirs.append(name)
-				else:
-					files.append(name)
-			curr["dirs"] = dirs
-			curr["files"] = files
-
-			# as the directory is new, we send a.. new... directory!
-			# message format: Dmmmm <length> <name>
-			# TODO: Exception catching
-			stat = self.sftpserver.getAttrs(curr["path"], followLinks=True)
-			print(" -- send dir", curr["path"], "D%04o %d %s" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
-			self.transport.write("D%04o %d %s\n" % (stat["permissions"] & 07777, 0, os.path.basename(curr["path"])))
-		elif len(curr["files"]) > 0:
-			f = curr["files"].pop(0)
-			(os.path.join(curr["path"], f))
-			self._initSendFile(os.path.join(curr["path"], f))
-			self.state = "sending-dir-file"
-			self._stateMachineNext(None)
-		elif len(curr["dirs"]) > 0:
-			d = curr["dirs"].pop(0)
-			self._dirStack.append({'path': os.path.join(curr["path"], d), 'files': None, 'dirs': None})
-			return self._sendDirectory()
-		else:
-			# done with this dir
-			self._dirStack.pop(-1)
-			print(" -- end dir", curr["path"])
-			self.transport.write("E\n")
-			if len(self._dirStack) > 0:
-				return self.S_DONE
-		return self.S_CONT
-
-	def _initRecvFile(self, name, length, mode):
-		print("initrecvfile")
-		path = os.path.join(self.args.target, name)
-		# try to open file, if fail send error
-		fileObj = None
-		try:
-			fileObj = self.sftpserver.openFile(path, FXF_WRITE | FXF_CREAT, {'permissions': mode})
-		except (SFTPError, OSError, IOError) as e:
-			self.sendError("Error opening file", e.strerror if getattr(e, "strerror") else e.message)
-		else:
-			print("Successfully receiving file")
-			self.state = "recv-file"
-			self._file = {'name': name, 'length': length, 'mode': mode, 'fileobj': fileObj, 'recvd': 0}
-			self.transport.write("\x00")
-
-	def _recvFile(self, data):
-		# check if recvd + datalen > length, only read (write) what's necessary
-		# if done change state back
-		# if data left when done call statemachine with it
-		leftToSend = self._file['length'] - self._file['recvd']
-		if len(data) >= leftToSend:
-			chunk = data[0:leftToSend]
-		else:
-			chunk = data
-		self._file['fileobj'].writeChunk(self._file['recvd'], chunk)
-
-		self._file['recvd'] += len(data)
-		if len(data) >= leftToSend:
-			# handle state machine stuff
-			self._file['fileobj'].close()
-			self._file = None
-			self.state = "recv-file-ack"
-
-			# if data left ==> back
-			if len(data) > leftToSend:
-				self._stateMachineNext(data[leftToSend:])
-
-	def _initRecvDir(self, name, mode):
-		print("initrecvdir", name, mode)
-		basepath = None
-		if len(self._dirStack) > 0:
-			basepath = os.path.join(self._dirStack[-1]["path"], name.lstrip("/"))
-		else:
-			basepath = os.path.join(self.args.target, name)
-
-		self._dirStack.append({"path": basepath, "name": name, "mode": mode})
-		attrs = None
-		try:
-			attrs = self.sftpserver.getAttrs(basepath, followLinks=True)
-		except OSError:
-			pass
-
-		print("my dir is", basepath, "with name", name, "and mode", mode)
-		if attrs != None:
-			if not attrs["isDir"]:
-				self.sendError("error", "Path %s already exists and is a file" % (basepath,))
-				return
-		else:
-			print("Creating directory", basepath)
-			# TODO: Exception catching
-			self.sftpserver.makeDirectory(basepath, {"permissions": mode})
-
-		self.transport.write("\x00")
-
-
-	def _stateMachineNext(self, data, init=False):
-		print("called _stateMachineNext(%s, %s) with state %s" % (repr(data), init, self.state))
-		if init:
-			if self.state == "init":
-				realpath = self.sftpserver._fixPath(self.args.target)
-				pathIsDir = os.path.isdir(realpath)
-				if pathIsDir and self.args.r:
-					self.singleFile = False
-				else:
-					self.singleFile = True
-
-				if self.args.d and not pathIsDir:
-					self.sendError("error", "Target is not a directory (was requested with -d)", fatal=True)
-					self.state = "borken"
-
-				if self.args.f:
-					# source mode, send file or dir
-					self.sourceMode = True
-					if os.path.isdir(realpath) and self.args.r:
-						self.singleFile = False
-						self._dirStack = []
-					else:
-						self.singleFile = True
-				elif self.args.t:
-					self._dirStack = []
-					self.sourceMode = False
-					# check if writable
-					if not self.sftpserver.chrootSpecs.allowWrite:
-						print("Write not allowed")
-						self.sendError("Error", "Write not allowed by server", fatal=True)
-					else:
-						# we need to begin ==> iterate state
-						self._stateMachineNext(None)
-				else:
-					self.sendError("Error", "please specify either -t or -f", fatal=True)
-			elif self.state == "cmd-parse-error":
-				print("Sending parse error")
-				self.sendError("Error", "could not parse command options (given: %s)\n" % (" ".join(self.cmd[1:])), fatal=True)
-			else:
-				print("Error: Unknown state in init phase of state machine, state was", self.state)
-		else:
-			# iterate state!
-			if self.sourceMode:
-				if self.state == "init":
-					if data != "\x00":
-						self.sendError("error", "Expected a 0x00 to initiate file transfer", fatal=True)
-						return
-					if self.singleFile:
-						self._initSendFile(self.args.target)
-						self.state = "sending-file"
-					else:
-						self._initSendDirectory(self.args.target)
-						self.state = "sending-dir"
-					self._stateMachineNext(None)
-				elif self.state == "sending-dir":
-					ret = self._sendDirectory()
-					if ret != self.S_CONT:
-						if ret == self.S_ERR:
-							# error, continue with state machine
-							self._stateMachineNext(None)
-						else:
-							self.state = "borken"
-							print("Losing connection")
-							self.transport.loseConnection()
-				elif self.state in ("sending-file", "sending-dir-file"):
-					ret = self._sendFile()
-					if ret != self.S_CONT:
-						if self.state == "sending-dir-file":
-							self.state = "sending-dir"
-							if ret == self.S_ERR:
-								# in case of error, call next state
-								self._stateMachineNext(None)
-						else:
-							print("Losing connection")
-							self.transport.loseConnection()
-							self.state = "borken"
-				elif self.state == "quit-after-data":
-					print("Losing connection")
-					self.transport.loseConnection()
-					self.state = "borken"
-				elif self.state == "borken":
-					print("broken, ignore")
-				else:
-					raise ValueError("unknown state %s" % self.state)
-			else:
-				if self.state == "init":
-					# send them a zero to show that we're fine with things!
-					self.transport.write("\x00")
-					self.state = "recv-ctrl-msg"
-				elif self.state == "recv-ctrl-msg":
-					# parse a message!
-					remainingData = None
-					if data[0] in ('C', 'D', 'T', 'E', '\x00', '\x01', '\x02'):
-						splitData = data.split("\n", 1)
-						if len(splitData) > 1 and splitData[1] != '':
-							remainingData = splitData
-						thisData = splitData[0]
-						msgType = thisData[0]
-						msg = thisData[1:].rstrip().split(" ")
-						print(" >> Control message", msgType, "with args", " ".join(msg))
-						if msgType == "C":
-							if len(msg) != 3:
-								self.sendError("Protocol Error", "Command 'C' takes ecactly 3 commands (%d given)" % len(msg), fatal=True)
-							mode, length, name = None, None, None
-							try:
-								mode = int(msg[0], 8)
-								length = int(msg[1])
-							except ValueError:
-								self.sendError("Protocol Error", "mode and length of 'C' command both need to be ints", fatal=True)
-							else:
-								name = msg[2]
-								# changes state if necessary, acks msg etc.
-								self._initRecvFile(name, length, mode)
-						elif msgType == "D":
-							if self.singleFile:
-								self.sendError("Error", "Stop sending directories when you are not recursive!", fatal=True)
-								return
-
-							if len(msg) != 3:
-								self.sendError("Protocol Error", "Command 'D' takes ecactly 3 commands (%d given)" % len(msg), fatal=True)
-							mode, length, name = None, None, None
-							try:
-								mode = int(msg[0], 8)
-								length = int(msg[1])
-							except ValueError:
-								self.sendError("Protocol Error", "mode and length of 'D' command both need to be ints", fatal=True)
-							else:
-								name = msg[2]
-								# changes state if necessary, acks msg etc.
-								self._initRecvDir(name, mode)
-						elif msgType == "T":
-							pass
-						elif msgType == "E":
-							if self.singleFile:
-								self.sendError("Error", "You are in single file mode, you are not allowed to send 'E'")
-							elif len(self._dirStack) <= 0:
-								self.sendError("Protocol error", "There is no directory left to end for command 'E'")
-							else:
-								self._dirStack.pop(0)
-								self.transport.write("\x00")
-						elif msgType == "\x00":
-							# ack!
-							print("out of range ack, guess we are going to close this connection")
-							self.transport.write("\x00")
-							print("Losing connection")
-							self.transport.loseConnection()
-							self.state = "borken"
-						elif msgType == "\x01":
-							# warning
-							print("User sent a warning, we are just going to ignore it (warning was %s)" % thisData[1:])
-							pass
-						elif msgType == "\x02":
-							print("Client sent fatal error:", data[1:])
-							print("Losing connection")
-							self.transport.loseConnection()
-							self.state = "borken"
-						else:
-							self.sendError("Protocol Error", "Unknown control message type '%s'" %   (repr(msgType),), fatal=True)
-
-						if remainingData != None:
-							self._stateMachineNext(remainingData)
-					else:
-						print("unknown control data", repr(data))
-						self.sendError("Protocol Error", "Well, I expected a control message from you and I found something starting with a '%s'. What a shame." % repr(msgType), fatal=True)
-				elif self.state == "recv-file":
-					self._recvFile(data)
-				elif self.state == "recv-file-ack":
-					if data == "\x00":
-						self.transport.write("\x00")
-						print("File received successfully!")
-					else:
-						print("Error receiving file, dunno. data was", repr(data))
-
-					self.state = "recv-ctrl-msg"
-				else:
-					print("Unknown sink-mode state")
-
-		print(" ?? _stateMachineNext is now in state", self.state)
-
-	def sendError(self, errCat, errMsg, fatal=False):
-		errbyte = "\x02" if fatal else "\x01"
-		msg = "scp: %s: %s\n" % (errCat, errMsg)
-		print(msg)
-
-		self.transport.write("%s%s" % (errbyte, msg))
-		if fatal:
-			self.state = "borken"
-			self.scpDisconnect(1)
-
-	def scpDisconnect(self, statuscode):
-		print("Disconnecting scp service")
-		self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(int(statuscode))))
-		self.state = "borken"
-
 	def connectionMade(self):
-		print("Connected scp")
-		self._stateMachineNext(None, init=True)
+		print("connection made")
+		self._callStateMachine()
 
 	def dataReceived(self, data):
-		print("===> DATA:", repr(data), "state:", self.state)
-		self._stateMachineNext(data)
+		self._buffer += data
+		self._callStateMachine()
 
 	def eofReceived(self):
-		print("NOTE: Eof received")
-		# TODO: differentiate depending on state
-		if self.sourceMode:
-			# source mode errors?
-			pass
-		else:
-			if not self.singleFile:
-				if len(self._dirStack) > 0:
-					self.sendError("Protocol error", "Unexpected EOF - there were directories left to send/end", fatal=True)
-					return
+		if self._scpMode == "sink":
+			if len(self._dirStack) > 0:
+				self.sendError("Protocol error: There were directories left to send/end.", fatal=True)
+				return False
 
 		self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(0)))
 
 	def connectionLost(self, reason):
-		print("Connection closed:", reason)
+		pass
+
+	def _callStateMachine(self):
+		if self._scpMode == "sink":
+			while self._callSinkMachine():
+				pass
+		elif self._scpMode == "source":
+			while self._callSourceMachine():
+				pass
+		else:
+			# TODO: Handle error condition
+			raise ValueError("unknwon scp mode '%s'" % self._scpMode)
+
+	def _getCtrlMsg(self):
+		""" Get a control message in format of X...\n, align buffer """
+		if "\n" in self._buffer:
+			msg, self._buffer = self._buffer.split("\n", 1)
+			return msg
+		else:
+			return None
+
+	def _callSinkMachine(self):
+		""" Implement a state machine handling scp in sink mode (receiving files) """
+		print("Sink machine in state", self._state)
+		if self._state == "init":
+			# prepare everything, send a \0 to indicate readiness
+			if not self.sftpserver.chrootSpecs.allowWrite:
+				self.sendError("Error", "Write not allowed by server", fatal=True)
+				return False
+			if len(self.args.target) > 1:
+				self._sendError("Error: Only one target can be specified as destination.", fatal=True)
+				return False
+
+			targetIsDir = False
+			try:
+				attrs = self.sftpserver.getAttrs(self.args.target[0], followLinks=True)
+				if attrs and attrs["isDir"]:
+					targetIsDir = True
+			except OSError:
+				pass
+
+			if self.args.d:
+				# target should be a directory
+				if not targetIsDir:
+					self.sendError("Error: Target is not a directory", fatal=True)
+					return False
+
+			if targetIsDir:
+				self._workingDir.append(self.args.target[0])
+			else:
+				self._targetFile = self.args.target[0]
+
+			self.transport.write("\0")
+			self._setSinkRecvState()
+			return False
+		elif self._state == "recv-file":
+			# receive a file
+			if len(self._buffer) > 0:
+				# write as much data as needed, but not more than currently available
+				datalen = min(len(self._buffer), self._recvState["length"] - self._recvState["recvd"])
+				try:
+					self._recvState["handle"].writeChunk(self._recvState["recvd"], self._buffer[0:datalen])
+				except (OSError, IOError) as e:
+					self.sendError("Error:", str(e))
+					try:
+						self._recvState["handle"].close()
+					except (OSError, IOError):
+						pass
+					self._recvState = None
+				else:
+					self._buffer = self._buffer[datalen:]
+					self._recvState["recvd"] += datalen
+
+					if self._recvState["length"] == self._recvState["recvd"]:
+						try:
+							self._recvState["handle"].close()
+						except (OSError, IOError):
+							pass
+						self._state = "recv-wait-zero"
+				return True
+		elif self._state == "recv-wait-zero":
+			# after file transfer, the source sends one \0. this is handled here
+			if len(self._buffer) > 0:
+				c = self._buffer[0]
+				self._buffer = self._buffer[1:]
+				if c == '\0':
+					self.transport.write('\0')
+					self._setSinkRecvState()
+				else:
+					self.sendError("Protocol error: I expected a \\0 from you.", fatal=True)
+				return True
+		else:
+			# we need to parse some sort of message
+			msg = self._getCtrlMsg()
+			if msg and len(msg) > 0:
+				if msg[0] in ("\1", "\2") and self._state not in ("error", "quit"):
+					# handle error messages sent by other side
+					print("%s: %s" % ("Error" if msg[0] == "\2" else "Warning", msg[1:]), file=sys.stderr)
+					if msg[0] == "\2":
+						self._closeConnection()
+				elif self._state == "recv-preserve":
+					# get c-time/a-time, to preserve file creation/access times
+					m = self.cmd_T.match(msg)
+					if m:
+						self.preserveTime = (int(m.group(1)), int(m.group(3)))
+						self._state = "recv-no-preserve"
+						# TODO call state machine for remaining data
+					else:
+						self._sendError("Protocol error: Could not parse protocol message, expected T-something.", fatal=True)
+				elif self._state == "recv-no-preserve":
+					if msg[0] == "C":
+						# receive a file
+						m = self.cmd_C.match(msg)
+						if m:
+							# mode, size, name
+							targetName = None
+							if self._targetFile:
+								targetName = self._targetFile
+							else:
+								targetName = m.group(3)
+
+							recvFile = {
+								"name": targetName,
+								"mode": int(m.group(1), 8) & 0777,
+								"length": int(m.group(2)),
+								"path": os.path.join(*(self._workingDir + self._dirStack + [targetName])),
+								"recvd": 0,
+								"handle": None,
+							}
+							try:
+								recvFile["handle"] = self.sftpserver.openFile(recvFile["path"], FXF_WRITE | FXF_CREAT, {'permissions': recvFile['mode']})
+							except (SFTPError, OSError, IOError) as e:
+								errorMsg = e.strerror if getattr(e, "strerror") else e.message
+								self._sendError("Error opening file:", errorMsg)
+							else:
+								self._recvState = recvFile
+								self._state = "recv-file"
+								self.transport.write("\0")
+						else:
+							self._sendError("Protocol error: Could not parse C-message.", fatal=True)
+					elif msg[0] == "D":
+						if self._recursive:
+							m = self.cmd_D.match(msg)
+							if m:
+								path = os.path.join(*(self._workingDir + self._dirStack + [m.group(2)]))
+								mode = int(m.group(1), 8) & 0777
+								attrs = None
+								success = True
+								try:
+									attrs = self.sftpserver.getAttrs(path, followLinks=True)
+								except OSError:
+									pass
+
+								if attrs and not attrs["isDir"]:
+									self.sendError("Error: Path '%s' already exists and is a file" % path)
+									success = False
+
+								if not attrs:
+									try:
+										self.sftpserver.makeDirectory(path, {"permissions": mode})
+									except (OSError, IOError, SFTPError) as e:
+										self.sendError("Error: Could not create directory: %s" % str(e))
+										success = False
+
+								if success:
+									self._dirStack.append(m.group(2))
+									self.transport.write("\0")
+									self._setSinkRecvState()
+							else:
+								self._sendError("Protocol error: Could not parse D-message.", fatal=True)
+						else:
+							self._sendError("Error: I am not recursive!")
+					elif msg[0] == "E":
+						if msg == "E":
+							if len(self._dirStack) > 0:
+								self._dirStack.pop()
+								self.transport.write("\0")
+							else:
+								self._sendError("Protocol error: Cannot 'end' not specified directory.", fatal=True)
+						else:
+							self._sendError("Protocol error: Could not parse E-message (expected only an E).", fatal=True)
+					else:
+						self._sendError("Protocol error: unparseable protocol message, exptected C/D/E.", fatal=True)
+				elif self._state == "recv-file":
+					pass
+				else:
+					raise ValueError("Unknown state")
+
+				return True
+			else:
+				if len(self._buffer) > 1024:
+					# no message found, buffer to big ==> terminate connection
+					self._sendError("Control message too long, closing connection", fatal=True)
+					return True
+
+	def _setSinkRecvState(self):
+		if self._preserve:
+			self._state = "recv-preserve"
+		else:
+			self._state = "recv-no-preserve"
+
+	def _sendError(self, msg, fatal=False):
+		errbyte = "\x02" if fatal else "\x01"
+		print("Sending error to client:", msg, file=sys.stderr)
+
+		self.transport.write("%s%s" % (errbyte, msg))
+		if fatal:
+			self.state = "error"
+			self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(int(1))))
+		else:
+			# no fatal error ==> return to recv state
+			self.state
 
 
 class ChrootSpecs(object):
