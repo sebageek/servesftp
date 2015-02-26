@@ -45,33 +45,30 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 		self._parser = self._genParser()
 		try:
 			self.args = self._parser.parse_args(cmd[1:])
-			print(self.args)
 		except SystemExit:
 			self.args = None
-			print("Error: Parser could not parse scp cmd", cmd)
-			self.state = "cmd-parse-error"
+			self._state = "init-error"
+			self._initErrorMsg = "Error: Parser could not parse scp cmd " + " ".join(cmd)
 
 		
 		self._buffer = ''
 		self._scpMode = "<unknown mode>"
 		self._state = "<unknown>"
-		self._recursive = self.args.r
-		self._preserve = self.args.p
 		self._workingDir = ["/"]
 		self._targetFile = None
+		self._transferMode = None
 		self._dirStack = []
 		self._preserveTime = None
-		if self.args:
-			self.sinkMode = self.args.f
 
 		if self.args:
+			self._recursive = self.args.r
+			self._preserve = self.args.p
+
+			self._state = "init"
 			if self.args.t:
 				self._scpMode = "sink"
-				self._state = "init"
 			else:
 				self._scpMode = "source"
-		else:
-			self._scpMode = "init-error"
 
 	def _genParser(self):
 		parser = argparse.ArgumentParser()
@@ -90,7 +87,6 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 		return "SCPProtocol"
 
 	def connectionMade(self):
-		print("connection made")
 		self._callStateMachine()
 
 	def dataReceived(self, data):
@@ -100,7 +96,7 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 	def eofReceived(self):
 		if self._scpMode == "sink":
 			if len(self._dirStack) > 0:
-				self.sendError("Protocol error: There were directories left to send/end.", fatal=True)
+				self._sendError("Protocol error: There were directories left to send/end.", fatal=True)
 				return False
 
 		self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(0)))
@@ -116,8 +112,7 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 			while self._callSourceMachine():
 				pass
 		else:
-			# TODO: Handle error condition
-			raise ValueError("unknwon scp mode '%s'" % self._scpMode)
+			self._sendError(self._initErrorMsg, fatal=True, useErrbyte=False)
 
 	def _getCtrlMsg(self):
 		""" Get a control message in format of X...\n, align buffer """
@@ -129,11 +124,11 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 
 	def _callSinkMachine(self):
 		""" Implement a state machine handling scp in sink mode (receiving files) """
-		print("Sink machine in state", self._state)
+		#print("Sink machine in state", self._state)
 		if self._state == "init":
 			# prepare everything, send a \0 to indicate readiness
 			if not self.sftpserver.chrootSpecs.allowWrite:
-				self.sendError("Error", "Write not allowed by server", fatal=True)
+				self._sendError("Error: Write not allowed by server", fatal=True)
 				return False
 			if len(self.args.target) > 1:
 				self._sendError("Error: Only one target can be specified as destination.", fatal=True)
@@ -150,7 +145,7 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 			if self.args.d:
 				# target should be a directory
 				if not targetIsDir:
-					self.sendError("Error: Target is not a directory", fatal=True)
+					self._sendError("Error: Target is not a directory", fatal=True)
 					return False
 
 			if targetIsDir:
@@ -159,8 +154,15 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 				self._targetFile = self.args.target[0]
 
 			self.transport.write("\0")
-			self._setSinkRecvState()
-			return False
+			self._state = "recv"
+
+			return True
+		elif self._state == "recv":
+			if self._preserve:
+				self._state = "recv-preserve"
+			else:
+				self._state = "recv-no-preserve"
+			return True
 		elif self._state == "recv-file":
 			# receive a file
 			if len(self._buffer) > 0:
@@ -169,12 +171,13 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 				try:
 					self._recvState["handle"].writeChunk(self._recvState["recvd"], self._buffer[0:datalen])
 				except (OSError, IOError) as e:
-					self.sendError("Error:", str(e))
 					try:
 						self._recvState["handle"].close()
 					except (OSError, IOError):
 						pass
 					self._recvState = None
+					self._sendError("Error writing to file: %s" % str(e))
+					self._state = "recv"
 				else:
 					self._buffer = self._buffer[datalen:]
 					self._recvState["recvd"] += datalen
@@ -193,9 +196,10 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 				self._buffer = self._buffer[1:]
 				if c == '\0':
 					self.transport.write('\0')
-					self._setSinkRecvState()
+					self._state = "recv"
 				else:
-					self.sendError("Protocol error: I expected a \\0 from you.", fatal=True)
+					self._sendError("Protocol error: I expected a \\0 from you.", fatal=True)
+					self._state = "error"
 				return True
 		else:
 			# we need to parse some sort of message
@@ -206,15 +210,18 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 					print("%s: %s" % ("Error" if msg[0] == "\2" else "Warning", msg[1:]), file=sys.stderr)
 					if msg[0] == "\2":
 						self._closeConnection()
+						self._state = "error"
+						return False
+					return True
 				elif self._state == "recv-preserve":
 					# get c-time/a-time, to preserve file creation/access times
 					m = self.cmd_T.match(msg)
 					if m:
 						self.preserveTime = (int(m.group(1)), int(m.group(3)))
 						self._state = "recv-no-preserve"
-						# TODO call state machine for remaining data
 					else:
 						self._sendError("Protocol error: Could not parse protocol message, expected T-something.", fatal=True)
+					return True
 				elif self._state == "recv-no-preserve":
 					if msg[0] == "C":
 						# receive a file
@@ -239,11 +246,14 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 								recvFile["handle"] = self.sftpserver.openFile(recvFile["path"], FXF_WRITE | FXF_CREAT, {'permissions': recvFile['mode']})
 							except (SFTPError, OSError, IOError) as e:
 								errorMsg = e.strerror if getattr(e, "strerror") else e.message
-								self._sendError("Error opening file:", errorMsg)
+								self._sendError("Error opening file '%s': %s" % (targetName, errorMsg))
+								self._state = "recv"
+								return True
 							else:
 								self._recvState = recvFile
 								self._state = "recv-file"
 								self.transport.write("\0")
+								return True
 						else:
 							self._sendError("Protocol error: Could not parse C-message.", fatal=True)
 					elif msg[0] == "D":
@@ -260,20 +270,21 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 									pass
 
 								if attrs and not attrs["isDir"]:
-									self.sendError("Error: Path '%s' already exists and is a file" % path)
+									self._sendError("Error: Path '%s' already exists and is a file" % path)
 									success = False
 
 								if not attrs:
 									try:
 										self.sftpserver.makeDirectory(path, {"permissions": mode})
 									except (OSError, IOError, SFTPError) as e:
-										self.sendError("Error: Could not create directory: %s" % str(e))
+										self._sendError("Error: Could not create directory: %s" % str(e))
 										success = False
 
 								if success:
 									self._dirStack.append(m.group(2))
 									self.transport.write("\0")
-									self._setSinkRecvState()
+									self._state = "recv"
+									return True
 							else:
 								self._sendError("Protocol error: Could not parse D-message.", fatal=True)
 						else:
@@ -283,13 +294,14 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 							if len(self._dirStack) > 0:
 								self._dirStack.pop()
 								self.transport.write("\0")
+								return True
 							else:
 								self._sendError("Protocol error: Cannot 'end' not specified directory.", fatal=True)
 						else:
 							self._sendError("Protocol error: Could not parse E-message (expected only an E).", fatal=True)
 					else:
 						self._sendError("Protocol error: unparseable protocol message, exptected C/D/E.", fatal=True)
-				elif self._state == "recv-file":
+				elif self._state == "error":
 					pass
 				else:
 					raise ValueError("Unknown state")
@@ -301,23 +313,198 @@ class SCPProtocol(internet.protocol.Protocol, log.Logger):
 					self._sendError("Control message too long, closing connection", fatal=True)
 					return True
 
-	def _setSinkRecvState(self):
-		if self._preserve:
-			self._state = "recv-preserve"
-		else:
-			self._state = "recv-no-preserve"
+	def _callSourceMachine(self):
+		""" Implement a state machine handling scp in source mode (sending files) """
+		#print("Source machine in state", self._state)
+		if self._state == "init":
+			self._sendTargets = self.args.target
+			self._sendSuccess = True
+			self._state = "ack-init"
 
-	def _sendError(self, msg, fatal=False):
-		errbyte = "\x02" if fatal else "\x01"
+			return True
+		elif self._state.startswith("ack-"):
+			if len(self._buffer) > 0:
+				if self._buffer[0] == "\0":
+					self._buffer = self._buffer[1:]
+
+					if self._state == "ack-init":
+						self._state = "next-file"
+					elif self._state == "ack-file-preserve":
+						self._state = "init-send-file"
+					elif self._state == "ack-send-file":
+						self._state = "send-file"
+					elif self._state == "ack-done-sending-file":
+						if self._transferMode == "dir":
+							self._state = "send-dir"
+						else:
+							self._state = "next-file"
+					elif self._state == "ack-dir-cmd":
+						self._state = "send-dir"
+					else:
+						raise ValueError("Unknown ack-state '%s', this is a bug in servesftp." % self._state)
+
+					return True
+				else:
+					self._sendError("Protocol error: Expected a binary zero as indication of readiness!", fatal=True)
+					return True
+		elif self._state == "next-file":
+			if len(self._sendTargets) == 0:
+				# if no files/dirs are left to send, quit
+				self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(0 if self._sendSuccess else 1)))
+				self._state = "done"
+				return False
+
+			target = self._sendTargets.pop(0)
+			attrs = None
+			try:
+				attrs = self.sftpserver.getAttrs(target, followLinks=True)
+			except (SFTPError, OSError, IOError) as e:
+				self._sendError("Could not stat file: %s\n" % e.strerror if getattr(e, "strerror") else e.message)
+				return True
+
+			# handle it
+			if attrs["isDir"] and not self._recursive:
+				self._sendError("Error: Target is a directory, and I am not recursive.")
+				return True
+
+			if attrs["isDir"]:
+				self._transferMode = "dir"
+				self._dirStack = []
+				self._addDirectory(target, attrs)
+
+				self._state = "send-dir"
+			else:
+				self._transferMode = "file"
+				self._initSendFile(target, attrs)
+				self._state = "init-send-file"
+
+			return True
+		elif self._state == "init-send-file":
+			path = self._transferFile["path"]
+
+			# check if we have attrs + a handle / open one if not
+			if not self._transferFile["attrs"] or not self._transferFile["handle"]:
+				try:
+					if not self._transferFile["attrs"]:
+						self._transferFile["attrs"] = self.sftpserver.getAttrs(path, followLinks=True)
+					if not self._transferFile["handle"]:
+						self._transferFile["handle"] = self.sftpserver.openFile(path, FXF_READ, {})
+				except (SFTPError, OSError, IOError) as e:
+					self._sendError("Could not open file '%s': %s\n" % (os.path.basename(path.strip("/")), e.strerror if getattr(e, "strerror") else e.message))
+					self._transferFile = None
+					if self._transferMode == "dir":
+						self._state = "send-dir"
+					else:
+						self._state = "next-file"
+					return True
+
+			stat = self._transferFile["attrs"]
+			if self._preserve and not self._transferFile["times-sent"]:
+				self.transport.write("T%d %d %d %d\n" % (stat['mtime'], 0, stat['atime'], 0))
+				self._transferFile["times-sent"] = True
+				self._state = "ack-file-preserve"
+			else:
+				self.transport.write("C%04o %d %s\n" % (stat["permissions"] & 07777, stat["size"], os.path.basename(path)))
+				self._state = "ack-send-file"
+
+			return True
+		elif self._state == "send-file":
+			handle = self._transferFile["handle"]
+			pos = 0
+			data = handle.readChunk(0, self.CHUNK_SIZE)
+			while data != '':
+				self.transport.write(data)
+				pos += self.CHUNK_SIZE
+				data = handle.readChunk(pos, self.CHUNK_SIZE)
+			handle.close()
+
+			self.transport.write("\0")
+			self._state = "ack-done-sending-file"
+			return True
+		elif self._state == "send-dir":
+			if len(self._dirStack) == 0:
+				self._state = "next-file"
+				return True
+
+			currDir = self._dirStack[-1]
+			if not currDir["attrs"] or currDir["list"] is None:
+				try:
+					if not currDir["attrs"]:
+						self._transferFile["attrs"] = self.sftpserver.getAttrs(currDir["path"], followLinks=True)
+					if currDir["list"] is None:
+						currDir["list"] = []
+						handle = self.sftpserver.openDirectory(currDir["path"])
+						for (name, lsline, attrs) in handle:
+							# need to get attrs for "isDir" key (with following symlinks)
+							attrs = self.sftpserver.getAttrs(os.path.join(currDir["path"], name), followLinks=True)
+							currDir["list"].append((name, attrs))
+				except (SFTPError, OSError, IOError) as e:
+					self._sendError("Could not open directory '%s': %s\n" % (os.path.basename(currDir["path"].rstrip("/")), e.strerror if getattr(e, "strerror") else e.message))
+					self._dirStack.pop()
+					return True
+
+			if self._preserve and not currDir["times-sent"]:
+				stat = currDir["attrs"]
+				self.transport.write("T%d %d %d %d\n" % (stat['mtime'], 0, stat['atime'], 0))
+				self._state = "ack-dir-cmd"
+				currDir["times-sent"] = True
+				return True
+			elif not currDir["dir-sent"]:
+				stat = currDir["attrs"]
+				self.transport.write("D%04o %d %s\n" % (stat["permissions"] & 07777, 0, os.path.basename(currDir["path"].rstrip("/"))))
+				currDir["dir-sent"] = True
+				self._state = "ack-dir-cmd"
+				return True
+
+
+			if len(currDir["list"]) == 0:
+				# list of files/dirs to send is empty, we are done with this directory
+				self._dirStack.pop()
+				self.transport.write("E\n")
+				self._state = "ack-dir-cmd"
+				return True
+
+			sendNext = currDir["list"].pop(0)
+			sendPath = os.path.join(*(self._workingDir + [currDir["path"], sendNext[0]]))
+			sendAttrs = sendNext[1]
+			if sendAttrs["isDir"]:
+				self._addDirectory(sendPath, sendAttrs)
+			else:
+				self._initSendFile(sendPath, sendAttrs)
+				self._state = "init-send-file"
+
+			return True
+		elif self._state == "error":
+			pass
+		else:
+			raise ValueError("Unknown state: %s" % self._state)
+
+	def _initSendFile(self, path, attrs=None):
+		self._transferFile = {
+			"path": path,
+			"attrs": attrs,
+			"handle": None,
+			"times-sent": False,
+		}
+
+	def _addDirectory(self, path, attrs=None):
+		self._dirStack.append(
+			{"path": path, "list": None, "attrs": attrs, "times-sent": False, "dir-sent": False}
+		)
+
+	def _sendError(self, msg, fatal=False, useErrbyte=True):
+		if useErrbyte:
+			errbyte = "\x02" if fatal else "\x01"
+		else:
+			errbyte = ''
 		print("Sending error to client:", msg, file=sys.stderr)
+		if len(msg) > 0 and msg[-1] != "\n":
+			msg += "\n"
 
 		self.transport.write("%s%s" % (errbyte, msg))
 		if fatal:
 			self.state = "error"
 			self.transport.processEnded(reason=failure.Failure(error.ProcessTerminated(int(1))))
-		else:
-			# no fatal error ==> return to recv state
-			self.state
 
 
 class ChrootSpecs(object):
@@ -641,7 +828,10 @@ class SFTPFile:
 
 	def getAttrs(self):
 		stat = os.fstat(self.fd)
-		return LimitedSFTPServer._statToAttrs(stat)
+		attrs = LimitedSFTPServer._statToAttrs(stat)
+		attrs["isDir"] = False
+
+		return attrs
 
 	def setAttrs(self, attrs):
 		raise NotImplementedError()
