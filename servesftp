@@ -21,7 +21,7 @@ from twisted.python import components, filepath, failure, log
 from twisted.cred import portal, checkers
 from twisted.conch import avatar, interfaces as conchinterfaces, checkers as conchcheckers
 from twisted.conch.ls import lsLine
-from twisted.conch.ssh import filetransfer, session, factory, keys
+from twisted.conch.ssh import filetransfer, session, channel, factory, keys
 from twisted.conch.ssh.filetransfer import SFTPError, FX_PERMISSION_DENIED, FXF_READ, FXF_WRITE, FXF_APPEND, FXF_CREAT, FXF_TRUNC, FXF_EXCL
 from zope.interface import implements
 
@@ -519,6 +519,19 @@ class ChrootSpecs(object):
 		return os.path.join(os.getcwd(), directory)
 
 
+class ExceptionFreeSSHSession(session.SSHSession):
+	""" Exception-free SSHSession version.
+
+	Sometimes when disconnecting (e.g. when issuing an unsupported command),
+	loseConnection() is called on the SSHSession. This function checks for
+	a client being present but not if it still has a transport.
+	"""
+	def loseConnection(self):
+		if self.client and self.client.transport:
+			self.client.transport.loseConnection()
+		channel.SSHChannel.loseConnection(self)
+
+
 class LimitedSFTPAvatar(avatar.ConchUser):
 	implements(conchinterfaces.ISession)
 
@@ -527,7 +540,7 @@ class LimitedSFTPAvatar(avatar.ConchUser):
 
 		self.avatarId = avatarId
 		self.chroot = chroot
-		self.channelLookup['session'] = session.SSHSession
+		self.channelLookup['session'] = ExceptionFreeSSHSession
 		self.subsystemLookup['sftp'] = filetransfer.FileTransferServer
 		self.debug = debug
 		self._scpprotocol = None
